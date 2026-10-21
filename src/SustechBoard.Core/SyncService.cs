@@ -113,6 +113,7 @@ public sealed class SyncService : IDisposable
     // ---------- two-tier discovery ----------
 
     private bool _forceFullScan;
+    private bool _pendingFullScan;
 
     /// <summary>Ask the next sync to rescan every course menu from scratch.</summary>
     public void RequestFullScan() => _forceFullScan = true;
@@ -346,24 +347,21 @@ public sealed class SyncService : IDisposable
 
     public void UpdateSettings(AppSettings settings, Secrets secrets)
     {
-        var userChanged = !string.Equals(_settings.Username, settings.Username, StringComparison.Ordinal);
-
         _settings = settings;
         _secrets = secrets;
         _client.UpdateCredentials(settings, secrets);
         _llm.Update(settings, secrets);
-
-        if (userChanged)
-        {
-            Log.Info($"账号已更换为 {settings.Username}，清空上一账号的数据");
-            ResetForAccountChange();
-        }
     }
 
-    /// <summary>Wipes every scraped row so a different account starts from a clean slate.</summary>
+    /// <summary>
+    /// Wipes every scraped row and forgets the login session so a different account starts clean.
+    /// Called when the account changes; safe to call repeatedly.
+    /// </summary>
     public void ResetForAccountChange()
     {
+        _client.ResetSession();
         _db.ClearAll();
+        _db.ClearLinks();
         _llmFailed.Clear();
         Items = Array.Empty<PanelItem>();
         AnnouncementCount = 0;
@@ -378,6 +376,17 @@ public sealed class SyncService : IDisposable
     {
         try
         {
+            // Data on disk belongs to the account recorded at the last successful sync.
+            // If the configured account is different, drop it before anything is shown.
+            var owner = _db.GetMeta("owner");
+            var current = _settings.Username.Trim();
+            if (owner is { Length: > 0 } && !string.Equals(owner, current, StringComparison.Ordinal))
+            {
+                Log.Info($"缓存属于账号 {owner}，当前配置为 {current}，直接清空");
+                ResetForAccountChange();
+                return;
+            }
+
             var all = _db.LoadAll();
             var analyses = _db.LoadAnalyses();
             AnnouncementCount = all.Count;
@@ -410,6 +419,22 @@ public sealed class SyncService : IDisposable
                 return result;
             }
 
+            // Authoritative account guard: the database records who owns the cached rows, so a
+            // switch is detected even after a restart and regardless of object aliasing.
+            var owner = _db.GetMeta("owner");
+            var currentUser = _settings.Username.Trim();
+            if (owner is { Length: > 0 } && !string.Equals(owner, currentUser, StringComparison.Ordinal))
+            {
+                Log.Info($"账号变更（{owner} → {currentUser}），清空本地数据后重新抓取");
+                _db.ClearAll();
+                _db.ClearLinks();
+                _llmFailed.Clear();
+                AnnouncementCount = 0;
+                CourseCount = 0;
+                _pendingFullScan = true;   // new account → discover its structure
+            }
+            _db.SetMeta("owner", currentUser);
+
             StatusChanged?.Invoke("正在读取课程…");
             var courses = await _fetcher.GetCoursesAsync(ct).ConfigureAwait(false);
             result.Courses = courses;
@@ -418,7 +443,7 @@ public sealed class SyncService : IDisposable
             // ---------- Tier A: full structure discovery (expensive, rare) ----------
             var records = _db.LoadCourseRecords();
             var fullScanDue = _settings.ContentScanEnabled &&
-                              (_forceFullScan || IsDiscoveryDue(records, courses));
+                              (_forceFullScan || _pendingFullScan || IsDiscoveryDue(records, courses));
 
             if (fullScanDue)
             {
@@ -431,6 +456,7 @@ public sealed class SyncService : IDisposable
                     catch (Exception ex) { Log.Error("结构发现失败: " + c.Name, ex); }
                 }
                 _forceFullScan = false;
+                _pendingFullScan = false;
                 records = _db.LoadCourseRecords();
             }
 

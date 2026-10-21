@@ -81,6 +81,11 @@ public sealed class BoardDatabase : IDisposable
                     computed_at  TEXT NOT NULL,
                     PRIMARY KEY (course_id, ann_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS meta (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """;
             cmd.ExecuteNonQuery();
 
@@ -396,6 +401,34 @@ public sealed class BoardDatabase : IDisposable
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = "DELETE FROM item_links;";
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    // ---------- small key/value store ----------
+
+    public string? GetMeta(string key)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT value FROM meta WHERE key = $k";
+            cmd.Parameters.AddWithValue("$k", key);
+            return cmd.ExecuteScalar() as string;
+        }
+    }
+
+    public void SetMeta(string key, string value)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO meta (key, value) VALUES ($k, $v)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """;
+            cmd.Parameters.AddWithValue("$k", key);
+            cmd.Parameters.AddWithValue("$v", value);
             cmd.ExecuteNonQuery();
         }
     }

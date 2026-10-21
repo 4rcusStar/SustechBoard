@@ -14,6 +14,7 @@ if (args.Length >= 1 && args[0] == "--dump")
     var dumpItems = Prioritizer.BuildAll(dumpAll, dumpAnalyses, dumpSettings, DateTimeOffset.Now);
 
     Console.WriteLine($"公告 {dumpAll.Count} 条 / 分析缓存 {dumpAnalyses.Count} 条");
+    Console.WriteLine($"数据归属账号: '{dumpDb.GetMeta("owner")}'  当前配置: '{dumpSettings.Username}'");
     Console.WriteLine("分布: " + string.Join("  ", dumpItems.GroupBy(i => i.Priority)
         .OrderBy(g => g.Key).Select(g => $"{g.Key}={g.Count()}")));
     Console.WriteLine($"归档拆分: 手动归档={dumpItems.Count(i => i.ArchiveKind == ArchiveKind.Manual)}  " +
@@ -28,6 +29,33 @@ if (args.Length >= 1 && args[0] == "--dump")
                           $"| {Trunc(i.Announcement.CourseName, 30),-30} | {Trunc(i.Announcement.Title, 34)}");
     }
     return 0;
+}
+
+// Dev helper: prove that changing the account drops the previous Blackboard session.
+if (args.Length >= 1 && args[0] == "--selftest-switch")
+{
+    var swSettings = SettingsStore.Load();
+    var swSecrets = SettingsStore.LoadSecrets();
+    if (swSecrets.Password.Length == 0) { Console.WriteLine("未配置凭据"); return 1; }
+
+    using var swClient = new BlackboardClient(swSettings, swSecrets);
+    var swLogin = await swClient.LoginAsync();
+    Console.WriteLine($"登录: {(swLogin.Success ? "成功" : "失败 " + swLogin.Message)}");
+    Console.WriteLine($"  SessionUser='{swClient.SessionUser}'  IsAuthenticated={swClient.IsAuthenticated}");
+    if (!swLogin.Success) return 1;
+
+    // Simulate the settings dialog writing a different SID.
+    var switched = new AppSettings
+    {
+        Username = "00000000",
+        CasServiceUrl = swSettings.CasServiceUrl
+    };
+    swClient.UpdateCredentials(switched, swSecrets);
+
+    Console.WriteLine($"切换后: SessionUser='{swClient.SessionUser}'  IsAuthenticated={swClient.IsAuthenticated}");
+    var ok = !swClient.IsAuthenticated && swClient.SessionUser.Length == 0;
+    Console.WriteLine(ok ? "SELFTEST PASS（旧会话已清除）" : "SELFTEST FAIL（旧会话仍在）");
+    return ok ? 0 : 1;
 }
 
 // Dev helper: show which rows the dedup pass folded away.

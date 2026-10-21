@@ -217,6 +217,19 @@ dotnet publish src\SustechBoard.App -c Release -r win-x64 --self-contained true 
 
 > 内容区条目没有"发布时间"，因此它们的过期判定只依据截止日期，不参与 60 天陈旧规则。
 
+## 更换账号
+
+换账号涉及三层状态，缺一层就会出现"点了刷新但没变化、必须重启"：
+
+| 层 | 旧行为 | 现在 |
+|---|---|---|
+| **登录会话** | `CookieContainer` 留着上一个账号的 Blackboard 会话，客户端以为"已登录"，抓到的还是旧账号数据 | 凭据变更时 `ResetSession()` 重建 HttpClient 与 Cookie 容器 |
+| **本地数据** | 设置对象被对话框就地修改，`_settings === settings`，变更检测永远为 false | 打开设置前先记下旧 SID，保存后比对；另在数据库写入 `owner`（上次成功登录的账号），**重启后也能识别** |
+| **发现路径** | 换了账号仍沿用旧账号的课程结构 | 账号变更即清空 `courses` / `course_paths`，并对新账号重新全量发现 |
+
+换号后的正确表现：面板立即清空 → 重新登录 → 全量扫描新账号的课程结构 → 重新抓取。
+日志会依次出现 `已重置登录会话（Cookie 清空）`、`账号变更（A → B）`、`开始全量课程结构扫描`。
+
 ## 数据位置
 
 `%LOCALAPPDATA%\SustechBoard\`

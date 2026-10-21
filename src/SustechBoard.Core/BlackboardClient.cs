@@ -25,8 +25,8 @@ public sealed class BlackboardClient : IDisposable
     private static readonly Regex CasMessageRegex =
         new("id=\"msg\"[^>]*>\\s*([^<]+)", RegexOptions.Compiled);
 
-    private readonly CookieContainer _cookies = new();
-    private readonly HttpClient _http;
+    private CookieContainer _cookies = new();
+    private HttpClient _http = null!;
     private AppSettings _settings;
     private Secrets _secrets;
 
@@ -34,33 +34,66 @@ public sealed class BlackboardClient : IDisposable
     public DateTimeOffset? LastLoginAt { get; private set; }
     public string LastError { get; private set; } = "";
 
+    /// <summary>Account the current session cookies belong to. Empty until a login succeeds.</summary>
+    public string SessionUser { get; private set; } = "";
+
     public BlackboardClient(AppSettings settings, Secrets secrets)
     {
         _settings = settings;
         _secrets = secrets;
+        _http = BuildHttp(out _cookies);
+    }
 
+    private static HttpClient BuildHttp(out CookieContainer cookies)
+    {
+        cookies = new CookieContainer();
         var handler = new HttpClientHandler
         {
             AllowAutoRedirect = true,
             UseCookies = true,
-            CookieContainer = _cookies,
+            CookieContainer = cookies,
             AutomaticDecompression = DecompressionMethods.All,
             MaxAutomaticRedirections = 12
         };
 
-        _http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(45) };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd(
+        var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(45) };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-        _http.DefaultRequestHeaders.Accept.ParseAdd(
+        http.DefaultRequestHeaders.Accept.ParseAdd(
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-        _http.DefaultRequestHeaders.AcceptLanguage.ParseAdd("zh-CN,zh;q=0.9,en;q=0.8");
+        http.DefaultRequestHeaders.AcceptLanguage.ParseAdd("zh-CN,zh;q=0.9,en;q=0.8");
+        return http;
+    }
+
+    /// <summary>
+    /// Drops every cookie and rebuilds the HTTP stack. Without this the previous account's
+    /// Blackboard session survives the credential change, the client looks "already logged in",
+    /// and every fetch keeps returning the old account's data until the app is restarted.
+    /// </summary>
+    public void ResetSession()
+    {
+        try { _http.Dispose(); } catch { /* already gone */ }
+        _http = BuildHttp(out _cookies);
+        IsAuthenticated = false;
+        LastLoginAt = null;
+        SessionUser = "";
+        Log.Info("已重置登录会话（Cookie 清空）");
     }
 
     public void UpdateCredentials(AppSettings settings, Secrets secrets)
     {
+        var requestedUser = settings.Username.Trim();
+
         _settings = settings;
         _secrets = secrets;
+
+        // The settings object is mutated in place, so compare against who the cookies belong to.
+        if (SessionUser.Length > 0 &&
+            !string.Equals(SessionUser, requestedUser, StringComparison.Ordinal))
+        {
+            ResetSession();
+        }
     }
 
     public string LoginUrl =>
@@ -91,6 +124,7 @@ public sealed class BlackboardClient : IDisposable
                 {
                     IsAuthenticated = true;
                     LastLoginAt = DateTimeOffset.Now;
+                    SessionUser = _settings.Username.Trim();
                     return new LoginResult(true, "已处于登录状态");
                 }
                 return Fail("未取到 CAS execution token");
@@ -132,6 +166,7 @@ public sealed class BlackboardClient : IDisposable
 
             IsAuthenticated = true;
             LastLoginAt = DateTimeOffset.Now;
+            SessionUser = _settings.Username.Trim();
             LastError = "";
             Log.Info("CAS 登录成功");
             return new LoginResult(true, "登录成功");

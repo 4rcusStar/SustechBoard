@@ -228,16 +228,27 @@ public partial class App : Application
 
     private void OpenSettings()
     {
+        // The dialog mutates the settings object in place, so the previous account must be
+        // captured before it opens — afterwards the old value is gone.
+        var beforeUser = _settings.Username.Trim();
+
         var dialog = new SettingsWindow(_settings, _secrets) { Topmost = true };
         var ok = dialog.ShowDialog();
 
-        if (ok == true && dialog.Saved)
+        if (ok != true || !dialog.Saved) return;
+
+        _sync?.UpdateSettings(_settings, _secrets);
+
+        var afterUser = _settings.Username.Trim();
+        if (!string.Equals(beforeUser, afterUser, StringComparison.Ordinal))
         {
-            _sync?.UpdateSettings(_settings, _secrets);
-            _panel?.ApplyDisplayMode();
-            _panel?.Reload();
-            _ = DoSyncAsync(false);
+            Log.Info($"账号已由 {beforeUser} 更换为 {afterUser}，清空本地数据");
+            _sync?.ResetForAccountChange();
         }
+
+        _panel?.ApplyDisplayMode();
+        _panel?.Reload();
+        _ = DoSyncAsync(false);
     }
 
     private void Notify(string title, string text)
