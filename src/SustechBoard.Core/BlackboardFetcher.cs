@@ -224,9 +224,19 @@ public sealed class BlackboardFetcher
     /// analysis layer extracts.
     /// </summary>
     public List<Announcement> ParseContentList(string html, CourseInfo course, string sourceMenu)
+        => ParseContentPage(html, course, sourceMenu).Items;
+
+    /// <summary>
+    /// Parses one content page into leaf items plus sub-folder links.
+    /// A folder is recognised by its href pointing back at listContent.jsp — a language-independent
+    /// signal, unlike the localised icon alt ("文件夹" / "Folder").
+    /// </summary>
+    public (List<Announcement> Items, List<(string Title, string Url)> Folders) ParseContentPage(
+        string html, CourseInfo course, string sourceMenu)
     {
         var doc = _parser.ParseDocument(html);
         var items = new List<Announcement>();
+        var folders = new List<(string Title, string Url)>();
         var now = DateTimeOffset.Now;
 
         foreach (var li in doc.QuerySelectorAll("li[id^='contentListItem']"))
@@ -244,6 +254,14 @@ public sealed class BlackboardFetcher
             if (title.Length == 0) continue;
 
             var kind = li.QuerySelector("img.item_icon")?.GetAttribute("alt")?.Trim() ?? "";
+
+            // A sub-folder is a container, not an item: descend into it instead of listing it.
+            var href = ToAbsolute((a.GetAttribute("href") ?? "").Trim());
+            if (href.Contains("listContent.jsp", StringComparison.OrdinalIgnoreCase))
+            {
+                if (folders.All(f => f.Url != href)) folders.Add((title, href));
+                continue;
+            }
 
             // Inline <script> blobs sit inside the details block; left in, they eat the whole
             // character budget and push the real "Due: …" line out of the captured text.
@@ -294,16 +312,61 @@ public sealed class BlackboardFetcher
             });
         }
 
-        return items;
+        return (items, folders);
     }
 
-    /// <summary>Fetches and parses one content area. Returns null when the request failed.</summary>
+    /// <summary>
+    /// Fetches a content area and any sub-folders inside it, breadth-first, bounded by depth
+    /// and a page budget. Returns null only when the *root* page failed, so callers can still
+    /// treat that as a fetch error.
+    /// </summary>
     public async Task<List<Announcement>?> FetchContentAreaAsync(
-        CourseInfo course, CoursePath path, CancellationToken ct = default)
+        CourseInfo course, CoursePath path, CancellationToken ct = default,
+        int maxDepth = 2, int maxPages = 25)
     {
-        var html = await _client.GetStringAsync(path.Url, ct).ConfigureAwait(false);
-        if (html is null) return null;
-        return ParseContentList(html, course, path.Display);
+        var result = new List<Announcement>();
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var queue = new Queue<(string Url, string Menu, int Depth)>();
+
+        queue.Enqueue((path.Url, path.Display, 0));
+        visited.Add(path.Url);
+
+        var pages = 0;
+        var rootFailed = false;
+
+        while (queue.Count > 0 && pages < maxPages)
+        {
+            if (ct.IsCancellationRequested) break;
+
+            var (url, menu, depth) = queue.Dequeue();
+            pages++;
+
+            var html = await _client.GetStringAsync(url, ct).ConfigureAwait(false);
+            if (html is null)
+            {
+                if (depth == 0) rootFailed = true;
+                continue;
+            }
+
+            var (items, folders) = ParseContentPage(html, course, menu);
+            result.AddRange(items);
+
+            if (folders.Count > 0)
+                Log.Info($"      ↳ {menu}: {items.Count} 条 + {folders.Count} 个子文件夹");
+
+            if (depth >= maxDepth) continue;
+
+            foreach (var f in folders)
+            {
+                if (!visited.Add(f.Url)) continue;
+                var childMenu = menu + " / " + f.Title;
+                if (childMenu.Length > 70) childMenu = childMenu[..70];
+                queue.Enqueue((f.Url, childMenu, depth + 1));
+            }
+        }
+
+        if (rootFailed) return null;
+        return result;
     }
 
     /// <summary>Blackboard wraps AJAX module payloads in an XML CDATA envelope.</summary>

@@ -30,6 +30,44 @@ if (args.Length >= 1 && args[0] == "--dump")
     return 0;
 }
 
+// Dev helper: verify that a content page splits leaf items from sub-folders.
+if (args.Length >= 1 && args[0] == "--selftest-folders")
+{
+    const string html = """
+        <ul id="content_listContainer" class="contentList">
+          <li id="contentListItem:_111_1" class="clearfix liItem read">
+            <img alt="File" class="item_icon">
+            <div class="item"><h3><a href="/webapps/blackboard/content/listContent.jsp?course_id=_C_1&amp;content_id=_111_1"><span>Week 1</span></a></h3></div>
+          </li>
+          <li id="contentListItem:_222_1" class="clearfix liItem read">
+            <img alt="Assignment" class="item_icon">
+            <div class="item"><h3><a href="/webapps/blackboard/assignment/uploadAssignment?content_id=_222_1"><span>HW1 Force Vectors</span></a></h3></div>
+            <div class="details">Due by Monday, 14 September 2026</div>
+          </li>
+          <li id="contentListItem:_333_1" class="clearfix liItem read">
+            <img alt="Folder" class="item_icon">
+            <div class="item"><h3><a href="/webapps/blackboard/content/listContent.jsp?course_id=_C_1&amp;content_id=_333_1"><span>Week 2</span></a></h3></div>
+          </li>
+        </ul>
+        """;
+
+    using var stClient = new BlackboardClient(new AppSettings(), new Secrets());
+    var stFetcher = new BlackboardFetcher(stClient);
+    var course = new CourseInfo("_C_1", "Selftest");
+    var (stItems, stFolders) = stFetcher.ParseContentPage(html, course, "Course Materials");
+
+    Console.WriteLine($"items={stItems.Count}  folders={stFolders.Count}");
+    foreach (var i in stItems) Console.WriteLine($"   item   : {i.Title}  kind={i.ContentKind}");
+    foreach (var f in stFolders) Console.WriteLine($"   folder : {f.Title} -> {f.Url}");
+
+    var ok = stItems.Count == 1
+             && stItems[0].Title == "HW1 Force Vectors"
+             && stFolders.Count == 2
+             && stFolders.All(f => f.Url.StartsWith("https://bb.sustech.edu.cn/", StringComparison.Ordinal));
+    Console.WriteLine(ok ? "SELFTEST PASS" : "SELFTEST FAIL");
+    return ok ? 0 : 1;
+}
+
 // Dev helper: search stored announcements (and their analysis) by keyword.
 if (args.Length >= 2 && args[0] == "--find")
 {
