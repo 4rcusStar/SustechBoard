@@ -178,22 +178,33 @@ public static class DateParsing
 
         var window = body.Substring(end, Math.Min(30, body.Length - end));
 
-        var m = Regex.Match(window, @"^[^\d]{0,12}(\d{1,2})\s*[:：]\s*(\d{2})");
+        // "晚23：59" / "晚上11：59" / "23:59"
+        var m = Regex.Match(window, @"^([^\d]{0,12})(\d{1,2})\s*[:：]\s*(\d{2})");
         if (m.Success)
         {
-            int h = int.Parse(m.Groups[1].Value), mi = int.Parse(m.Groups[2].Value);
+            int h = int.Parse(m.Groups[2].Value), mi = int.Parse(m.Groups[3].Value);
+            if (IsPm(m.Groups[1].Value) && h < 12) h += 12;
             if (h is >= 0 and <= 23 && mi is >= 0 and <= 59) { time = (h, mi); return true; }
         }
 
-        var m2 = Regex.Match(window, @"^[^\d]{0,12}(\d{1,2})\s*时\s*(\d{1,2})\s*分");
+        // "晚11点59分" / "下午三时" — accept 点 as well as 时
+        var m2 = Regex.Match(window, @"^([^\d]{0,12})(\d{1,2})\s*[时点]\s*(\d{1,2})\s*分");
         if (m2.Success)
         {
-            int h = int.Parse(m2.Groups[1].Value), mi = int.Parse(m2.Groups[2].Value);
+            int h = int.Parse(m2.Groups[2].Value), mi = int.Parse(m2.Groups[3].Value);
+            if (IsPm(m2.Groups[1].Value) && h < 12) h += 12;
             if (h is >= 0 and <= 23 && mi is >= 0 and <= 59) { time = (h, mi); return true; }
         }
 
         return false;
     }
+
+    /// <summary>Chinese/English evening markers that turn 11:59 into 23:59.</summary>
+    private static bool IsPm(string prefix) =>
+        prefix.Contains('晚') ||
+        prefix.Contains("下午", StringComparison.Ordinal) ||
+        prefix.Contains("傍晚", StringComparison.Ordinal) ||
+        prefix.Contains("PM", StringComparison.OrdinalIgnoreCase);
 
     private static bool NearDeadlineKeyword(string body, int index)
     {

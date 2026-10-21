@@ -53,6 +53,120 @@ public sealed class SyncService : IDisposable
         Updated?.Invoke();
     }
 
+    // ---------- two-tier discovery ----------
+
+    private bool _forceFullScan;
+
+    /// <summary>Ask the next sync to rescan every course menu from scratch.</summary>
+    public void RequestFullScan() => _forceFullScan = true;
+
+    /// <summary>Number of content areas currently being crawled on every sync.</summary>
+    public int SelectedPathCount
+    {
+        get
+        {
+            try { return _db.LoadCoursePaths().Count(p => p.Selected); }
+            catch { return 0; }
+        }
+    }
+
+    private static string MenuHash(List<MenuEntry> menu) =>
+        Hash.Sha256(string.Join("|", menu.Where(m => m.IsContentArea)
+            .Select(m => m.Group + "/" + m.Label + "@" + m.Url)));
+
+    private bool IsDiscoveryDue(List<CourseRecord> records, List<CourseInfo> courses)
+    {
+        if (records.Count == 0) return true;
+
+        // A course we have never seen: new enrolment, or a switched account.
+        if (courses.Any(c => records.All(r => r.Id != c.Id))) return true;
+
+        var days = Math.Max(1, _settings.FullScanIntervalDays);
+        var cutoff = DateTimeOffset.Now.AddDays(-days);
+        return records.Any(r => r.DiscoveredAt is null || r.DiscoveredAt < cutoff);
+    }
+
+    private static bool LooksLikeWork(string label) =>
+        new[] { "作业", "assignment", "homework", "quiz", "test", "exam",
+                "考试", "测验", "任务", "评价", "assessment" }
+            .Any(k => label.Contains(k, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Tier A: read a course menu, let the model (or keyword rules) choose which content
+    /// areas are worth crawling, probe the chosen ones, and persist the result.
+    /// </summary>
+    private async Task DiscoverCourseAsync(CourseInfo course, List<MenuEntry>? menu, CancellationToken ct)
+    {
+        menu ??= await _fetcher.GetCourseMenuAsync(course, ct).ConfigureAwait(false);
+        var candidates = menu.Where(m => m.IsContentArea).ToList();
+        var now = DateTimeOffset.Now;
+
+        var paths = candidates.Select(m => new CoursePath
+        {
+            CourseId = course.Id,
+            PathKey = Hash.Sha256(m.Url)[..12],
+            Label = m.Label,
+            Group = m.Group,
+            Url = m.Url,
+            DiscoveredAt = now
+        }).ToList();
+
+        if (paths.Count > 0)
+        {
+            var labels = paths.Select(p => p.Display).ToList();
+
+            HashSet<int>? picked = null;
+            if (_llm.IsConfigured)
+                picked = await _llm.PickContentAreasAsync(course.Name, labels, ct).ConfigureAwait(false);
+
+            picked ??= new HashSet<int>(
+                Enumerable.Range(0, labels.Count).Where(i => LooksLikeWork(labels[i])));
+
+            var pickedList = picked.OrderBy(i => i).ToList();
+
+            // Safety net: if the model found nothing, still probe the two best keyword hits
+            // rather than silently scanning nothing at all.
+            if (pickedList.Count == 0)
+            {
+                pickedList = Enumerable.Range(0, labels.Count)
+                                       .Where(i => LooksLikeWork(labels[i]))
+                                       .Take(2)
+                                       .ToList();
+                if (pickedList.Count > 0)
+                    Log.Warn($"{course.Name}: 模型未选出内容区，回退关键字猜测");
+            }
+
+            var capped = pickedList.Take(Math.Max(1, _settings.MaxContentAreasPerCourse)).ToList();
+
+            foreach (var i in capped)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                var p = paths[i];
+                var items = await _fetcher.FetchContentAreaAsync(course, p, ct).ConfigureAwait(false);
+                if (items is null) continue;
+
+                p.ItemCount = items.Count;
+
+                // Ground truth beats guessing: an area counts only if it really holds work.
+                var hasWork = items.Any(a => a.ContentKind is "作业" or "测验" or "考试" or "测试");
+                p.Selected = hasWork || (items.Count > 0 && LooksLikeWork(p.Display));
+                if (p.Selected) p.LastOkAt = DateTimeOffset.Now;
+            }
+        }
+
+        _db.SaveCoursePaths(course.Id, paths);
+        _db.UpsertCourseRecord(new CourseRecord
+        {
+            Id = course.Id,
+            Name = course.Name,
+            MenuHash = MenuHash(menu),
+            DiscoveredAt = now
+        });
+
+        Log.Info($"{course.Name}: 内容区 {paths.Count} 个，探测选中 {paths.Count(p => p.Selected)} 个");
+    }
+
     /// <summary>
     /// Flattens every announcement's events into calendar entries.
     /// Archive state is deliberately ignored: a manually archived item's exam still happens,
@@ -182,20 +296,94 @@ public sealed class SyncService : IDisposable
             result.Courses = courses;
             CourseCount = courses.Count;
 
+            // ---------- Tier A: full structure discovery (expensive, rare) ----------
+            var records = _db.LoadCourseRecords();
+            var fullScanDue = _settings.ContentScanEnabled &&
+                              (_forceFullScan || IsDiscoveryDue(records, courses));
+
+            if (fullScanDue)
+            {
+                StatusChanged?.Invoke("正在扫描课程结构…");
+                Log.Info($"开始全量课程结构扫描（{courses.Count} 门课）");
+                foreach (var c in courses)
+                {
+                    if (ct.IsCancellationRequested) break;
+                    try { await DiscoverCourseAsync(c, null, ct).ConfigureAwait(false); }
+                    catch (Exception ex) { Log.Error("结构发现失败: " + c.Name, ex); }
+                }
+                _forceFullScan = false;
+                records = _db.LoadCourseRecords();
+            }
+
+            // ---------- Tier B pass 1: announcements + free menu-change detection ----------
             StatusChanged?.Invoke($"正在抓取 {courses.Count} 门课的公告…");
             var all = new List<Announcement>();
             var fetchComplete = courses.Count > 0;
+            var staleStructure = new List<(CourseInfo Course, List<MenuEntry> Menu)>();
 
             foreach (var c in courses)
             {
                 if (ct.IsCancellationRequested) break;
-                var items = await _fetcher.GetAnnouncementsAsync(c, ct).ConfigureAwait(false);
+
+                var (menu, items) = await _fetcher.GetCourseAnnouncementsAsync(c, ct).ConfigureAwait(false);
                 if (items is null)
                 {
                     fetchComplete = false;   // partial fetch — never reconcile on this
                     continue;
                 }
                 all.AddRange(items);
+
+                // Structure changed under us? Rediscover this course before reading its areas.
+                if (_settings.ContentScanEnabled)
+                {
+                    var rec = records.FirstOrDefault(r => r.Id == c.Id);
+                    var hash = MenuHash(menu);
+                    if (rec is not null && rec.MenuHash.Length > 0 && rec.MenuHash != hash)
+                    {
+                        Log.Info($"{c.Name}: 菜单结构变化，重新发现内容区");
+                        staleStructure.Add((c, menu));
+                    }
+                }
+            }
+
+            foreach (var (course, menu) in staleStructure)
+            {
+                if (ct.IsCancellationRequested) break;
+                try { await DiscoverCourseAsync(course, menu, ct).ConfigureAwait(false); }
+                catch (Exception ex) { Log.Error("结构发现失败: " + course.Name, ex); }
+            }
+
+            // ---------- Tier B pass 2: selected content areas ----------
+            if (_settings.ContentScanEnabled)
+            {
+                var selected = _db.LoadCoursePaths()
+                                  .Where(p => p.Selected)
+                                  .GroupBy(p => p.CourseId)
+                                  .ToDictionary(g => g.Key, g => g.ToList());
+
+                if (selected.Count > 0)
+                {
+                    StatusChanged?.Invoke("正在抓取作业/测验区…");
+                    foreach (var c in courses)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        if (!selected.TryGetValue(c.Id, out var paths)) continue;
+
+                        foreach (var path in paths)
+                        {
+                            var content = await _fetcher.FetchContentAreaAsync(c, path, ct).ConfigureAwait(false);
+                            if (content is null)
+                            {
+                                _db.RecordPathResult(c.Id, path.PathKey, false);
+                                fetchComplete = false;
+                                continue;
+                            }
+                            _db.RecordPathResult(c.Id, path.PathKey, true);
+                            all.AddRange(content);
+                            Log.Info($"  {c.Name} · {path.Display}: {content.Count} 条");
+                        }
+                    }
+                }
             }
 
             if (ct.IsCancellationRequested) fetchComplete = false;

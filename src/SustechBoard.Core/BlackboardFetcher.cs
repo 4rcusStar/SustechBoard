@@ -54,12 +54,97 @@ public sealed class BlackboardFetcher
     }
 
     /// <summary>
+    /// Parses the course menu out of any course page. Blackboard renders it as
+    /// li[id^=paletteItem] entries where class "subhead" is a group label (no link),
+    /// "divider" is a rule, and everything else carries an &lt;a&gt;.
+    /// </summary>
+    public List<MenuEntry> ParseCourseMenu(string html)
+    {
+        var result = new List<MenuEntry>();
+        if (string.IsNullOrWhiteSpace(html)) return result;
+
+        var doc = _parser.ParseDocument(html);
+        var group = "";
+
+        foreach (var li in doc.QuerySelectorAll("li[id^='paletteItem']"))
+        {
+            var cls = li.ClassName ?? "";
+            if (cls.Contains("divider", StringComparison.OrdinalIgnoreCase)) continue;
+
+            if (cls.Contains("subhead", StringComparison.OrdinalIgnoreCase))
+            {
+                var span = li.QuerySelector("h3 span[title]");
+                group = System.Net.WebUtility.HtmlDecode(
+                    span?.GetAttribute("title")?.Trim() ?? Collapse(li.TextContent));
+                continue;
+            }
+
+            var a = li.QuerySelector("a[href]");
+            if (a is null) continue;
+
+            var href = (a.GetAttribute("href") ?? "").Trim();
+            if (href.Length == 0 || href == "#") continue;
+
+            var labelSpan = a.QuerySelector("span[title]");
+            var label = System.Net.WebUtility.HtmlDecode(
+                labelSpan?.GetAttribute("title")?.Trim() ?? Collapse(a.TextContent));
+            if (label.Length == 0) continue;
+
+            var isContent = href.Contains("listContent.jsp", StringComparison.OrdinalIgnoreCase);
+            var absolute = ToAbsolute(href);
+
+            if (result.All(m => m.Url != absolute))
+                result.Add(new MenuEntry(label, group, absolute, isContent));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Blackboard emits root-relative hrefs on live pages (but absolute ones in saved
+    /// snapshots), so anything non-absolute is resolved against the Blackboard base.
+    /// </summary>
+    private static string ToAbsolute(string href)
+    {
+        if (href.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+            href.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            return href;
+
+        if (href.StartsWith("//", StringComparison.Ordinal))
+            return "https:" + href;
+
+        return href.StartsWith('/')
+            ? BlackboardClient.BbBase + href
+            : BlackboardClient.BbBase + "/" + href;
+    }
+
+    /// <summary>Fetches one course page and returns its parsed menu.</summary>
+    public async Task<List<MenuEntry>> GetCourseMenuAsync(CourseInfo course, CancellationToken ct = default)
+    {
+        var url = BlackboardClient.BbBase + "/webapps/blackboard/execute/announcement" +
+                  "?method=search&context=course_entry" +
+                  $"&course_id={Uri.EscapeDataString(course.Id)}" +
+                  "&handle=announcements_entry&mode=view";
+
+        var html = await _client.GetStringAsync(url, ct).ConfigureAwait(false);
+        return html is null ? new List<MenuEntry>() : ParseCourseMenu(html);
+    }
+
+    /// <summary>
     /// Reads every announcement of one course site.
     /// Returns <c>null</c> when the request failed — distinct from an empty list
     /// ("this course genuinely has no announcements"), which callers need to tell apart
     /// before deleting stale rows.
     /// </summary>
     public async Task<List<Announcement>?> GetAnnouncementsAsync(CourseInfo course, CancellationToken ct = default)
+        => (await GetCourseAnnouncementsAsync(course, ct).ConfigureAwait(false)).Items;
+
+    /// <summary>
+    /// One request, two payloads: the course menu (for cheap structure-change detection)
+    /// and the announcements themselves. Items is null when the fetch failed.
+    /// </summary>
+    public async Task<(List<MenuEntry> Menu, List<Announcement>? Items)> GetCourseAnnouncementsAsync(
+        CourseInfo course, CancellationToken ct = default)
     {
         var url = BlackboardClient.BbBase + "/webapps/blackboard/execute/announcement" +
                   "?method=search&context=course_entry" +
@@ -70,10 +155,15 @@ public sealed class BlackboardFetcher
         if (html is null)
         {
             Log.Warn($"  {course.Name}: 公告抓取失败");
-            return null;
+            return (new List<MenuEntry>(), null);
         }
 
-        var doc = await _parser.ParseDocumentAsync(html, ct).ConfigureAwait(false);
+        return (ParseCourseMenu(html), ParseAnnouncements(html, course));
+    }
+
+    private List<Announcement> ParseAnnouncements(string html, CourseInfo course)
+    {
+        var doc = _parser.ParseDocument(html);
         var items = new List<Announcement>();
         var now = DateTimeOffset.Now;
 
@@ -112,6 +202,7 @@ public sealed class BlackboardFetcher
                 PublishedAt = published,
                 Author = author,
                 ContentHash = Hash.Sha256(course.Id + "|" + title + "|" + body),
+                Origin = "announcement",
                 FirstSeen = now,
                 LastChanged = now
             });
@@ -119,6 +210,84 @@ public sealed class BlackboardFetcher
 
         Log.Info($"  {course.Name}: {items.Count} 条公告");
         return items;
+    }
+
+    /// <summary>
+    /// Parses one content area (e.g. 学习评价 / 我的作业). Content items carry no publish
+    /// time, so the deadline has to come from the body text — which is exactly what the
+    /// analysis layer extracts.
+    /// </summary>
+    public List<Announcement> ParseContentList(string html, CourseInfo course, string sourceMenu)
+    {
+        var doc = _parser.ParseDocument(html);
+        var items = new List<Announcement>();
+        var now = DateTimeOffset.Now;
+
+        foreach (var li in doc.QuerySelectorAll("li[id^='contentListItem']"))
+        {
+            var raw = li.Id ?? "";
+            var id = raw.StartsWith("contentListItem:", StringComparison.Ordinal)
+                ? raw["contentListItem:".Length..]
+                : raw;
+            if (!ItemIdRegex.IsMatch(id)) continue;
+
+            var a = li.QuerySelector("h3 a[href]");
+            if (a is null) continue;
+
+            var title = Collapse(a.TextContent);
+            if (title.Length == 0) continue;
+
+            var kind = li.QuerySelector("img.item_icon")?.GetAttribute("alt")?.Trim() ?? "";
+
+            var parts = new List<string>();
+            if (kind.Length > 0) parts.Add($"【{kind}】");
+
+            var bodyEl = li.QuerySelector("div.vtbegenerated");
+            if (bodyEl is not null)
+            {
+                var text = Collapse(bodyEl.TextContent);
+                if (text.Length > 0) parts.Add(text);
+            }
+
+            // Attachment names often carry the assignment title (hw3.pdf) — useful signal.
+            var attachments = li.QuerySelectorAll("ul.attachments li a")
+                .Select(x => Collapse(x.TextContent))
+                .Where(x => x.Length > 0)
+                .Take(5)
+                .ToList();
+            if (attachments.Count > 0) parts.Add("附件: " + string.Join("; ", attachments));
+
+            var body = string.Join(" ", parts);
+            if (body.Length == 0) body = title;
+
+            items.Add(new Announcement
+            {
+                Id = id,
+                CourseId = course.Id,
+                CourseName = course.Name,
+                Title = title,
+                Body = body,
+                PublishedAt = null,             // content items have no publish time
+                Author = "",
+                ContentHash = Hash.Sha256(course.Id + "|" + title + "|" + body),
+                Origin = "content",
+                SourceMenu = sourceMenu,
+                ContentKind = kind,
+                FirstSeen = now,
+                LastChanged = now
+            });
+        }
+
+        return items;
+    }
+
+    /// <summary>Fetches and parses one content area. Returns null when the request failed.</summary>
+    public async Task<List<Announcement>?> FetchContentAreaAsync(
+        CourseInfo course, CoursePath path, CancellationToken ct = default)
+    {
+        var html = await _client.GetStringAsync(path.Url, ct).ConfigureAwait(false);
+        if (html is null) return null;
+        return ParseContentList(html, course, path.Display);
     }
 
     /// <summary>Blackboard wraps AJAX module payloads in an XML CDATA envelope.</summary>

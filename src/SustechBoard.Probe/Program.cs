@@ -30,6 +30,141 @@ if (args.Length >= 1 && args[0] == "--dump")
     return 0;
 }
 
+// Dev helper: forget all discovered course paths so the next sync rescans every menu.
+if (args.Length >= 1 && args[0] == "--reset-discovery")
+{
+    using var rdConn = new Microsoft.Data.Sqlite.SqliteConnection(
+        $"Data Source={AppPaths.DatabaseFile}");
+    rdConn.Open();
+    using var rdCmd = rdConn.CreateCommand();
+    rdCmd.CommandText = "DELETE FROM course_paths; DELETE FROM courses;";
+    var rd = rdCmd.ExecuteNonQuery();
+    Console.WriteLine($"已清除发现记录（{rd} 行），下次同步将全量扫描");
+    return 0;
+}
+
+// Dev helper: show discovered course paths and their selection state.
+if (args.Length >= 1 && args[0] == "--list-paths")
+{
+    using var lpDb = new BoardDatabase();
+    var lp = lpDb.LoadCoursePaths();
+    foreach (var g in lp.GroupBy(p => p.CourseId))
+    {
+        var sel = g.Count(x => x.Selected);
+        Console.WriteLine($"course {g.Key}: {g.Count()} 个内容区, 选中 {sel}");
+        foreach (var p in g)
+            Console.WriteLine($"    {(p.Selected ? "[✓]" : "[ ]")} {p.Display}  items={p.ItemCount}");
+    }
+    return 0;
+}
+
+// Dev helper: for one course, list every content area and report what parsing yields.
+if (args.Length >= 2 && args[0] == "--probe-areas")
+{
+    var paSettings = SettingsStore.Load();
+    var paSecrets = SettingsStore.LoadSecrets();
+    if (paSecrets.Password.Length == 0) { Console.WriteLine("未配置凭据"); return 1; }
+
+    using var paClient = new BlackboardClient(paSettings, paSecrets);
+    var paLogin = await paClient.LoginAsync();
+    Console.WriteLine($"登录: {(paLogin.Success ? "成功" : "失败 " + paLogin.Message)}");
+    if (!paLogin.Success) return 1;
+
+    var paFetcher = new BlackboardFetcher(paClient);
+    var paCourses = await paFetcher.GetCoursesAsync();
+    var target = paCourses.FirstOrDefault(c => c.Id == args[1])
+                 ?? paCourses.FirstOrDefault(c => c.Name.Contains(args[1], StringComparison.Ordinal));
+    if (target is null) { Console.WriteLine("未找到课程 " + args[1]); return 1; }
+
+    Console.WriteLine($"课程: {target.Name} ({target.Id})");
+    var paMenu = await paFetcher.GetCourseMenuAsync(target);
+    var areas = paMenu.Where(m => m.IsContentArea).ToList();
+    Console.WriteLine($"内容区 {areas.Count} 个");
+
+    foreach (var m in areas)
+    {
+        var path = new CoursePath
+        {
+            CourseId = target.Id,
+            PathKey = Hash.Sha256(m.Url)[..12],
+            Label = m.Label,
+            Group = m.Group,
+            Url = m.Url,
+            DiscoveredAt = DateTimeOffset.Now
+        };
+        var items = await paFetcher.FetchContentAreaAsync(target, path);
+        if (items is null)
+        {
+            Console.WriteLine($"  [{m.Group}] {m.Label}: 抓取失败");
+            continue;
+        }
+        var kinds = string.Join("/", items.Select(i => i.ContentKind).Distinct());
+        Console.WriteLine($"  [{m.Group}] {m.Label}: {items.Count} 条  类型={kinds}");
+        foreach (var it in items.Take(3))
+            Console.WriteLine($"      · {it.Title}  | {Trunc(it.Body, 60)}");
+    }
+    return 0;
+}
+
+// Dev helper: log in and dump each course's menu, highlighting content areas.
+if (args.Length >= 1 && args[0] == "--discover")
+{
+    var dvSettings = SettingsStore.Load();
+    var dvSecrets = SettingsStore.LoadSecrets();
+    if (dvSecrets.Password.Length == 0) { Console.WriteLine("未配置凭据"); return 1; }
+
+    using var dvClient = new BlackboardClient(dvSettings, dvSecrets);
+    var dvLogin = await dvClient.LoginAsync();
+    Console.WriteLine($"登录: {(dvLogin.Success ? "成功" : "失败 " + dvLogin.Message)}");
+    if (!dvLogin.Success) return 1;
+
+    var dvFetcher = new BlackboardFetcher(dvClient);
+    var dvCourses = await dvFetcher.GetCoursesAsync();
+
+    foreach (var c in dvCourses)
+    {
+        var menu = await dvFetcher.GetCourseMenuAsync(c);
+        var content = menu.Where(m => m.IsContentArea).ToList();
+        Console.WriteLine();
+        Console.WriteLine($"=== {c.Name}  ({c.Id})  menu={menu.Count}  contentAreas={content.Count}");
+        foreach (var m in content)
+            Console.WriteLine($"    [{m.Group}] {m.Label}");
+    }
+    return 0;
+}
+
+// Dev helper: run the rule-layer date parser over a JSON list of {title, body, expect} cases.
+if (args.Length >= 2 && args[0] == "--parse-dates")
+{
+    using var caseDoc = System.Text.Json.JsonDocument.Parse(
+        File.ReadAllText(args[1], Encoding.UTF8));
+
+    var anchor = DateTimeOffset.Now;
+    Console.WriteLine($"anchor(now) = {anchor:yyyy-MM-dd HH:mm}");
+    Console.WriteLine(new string('-', 86));
+
+    int caseTotal = 0, casePass = 0;
+    foreach (var el in caseDoc.RootElement.EnumerateArray())
+    {
+        caseTotal++;
+        var title = el.GetProperty("title").GetString() ?? "";
+        var body = el.GetProperty("body").GetString() ?? "";
+        var expect = el.GetProperty("expect").GetString() ?? "";
+
+        var hit = DateParsing.FindDeadline(body, anchor);
+        var got = hit is { } h ? $"{h.Value:yyyy-MM-dd HH:mm}  conf={h.Confidence:0.00}" : "（未识别）";
+        var ok = hit is { } x && expect.StartsWith(x.Value.ToString("yyyy-MM-dd"), StringComparison.Ordinal);
+        if (ok) casePass++;
+
+        Console.WriteLine($"{(ok ? "✓" : "✗")} {title,-8} 得到 {got}");
+        Console.WriteLine($"   期望 {expect}");
+    }
+
+    Console.WriteLine(new string('-', 86));
+    Console.WriteLine($"命中 {casePass}/{caseTotal}");
+    return casePass == caseTotal ? 0 : 1;
+}
+
 static string Trunc(string s, int n) => s.Length <= n ? s : s[..n] + "…";
 
 // Dev helper: inject a fake announcement to prove stale-row reconciliation works.

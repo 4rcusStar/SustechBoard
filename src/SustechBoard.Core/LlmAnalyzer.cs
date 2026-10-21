@@ -134,6 +134,103 @@ public sealed class LlmAnalyzer : IDisposable
         return new LlmProbeResult(true, msg, sw.ElapsedMilliseconds);
     }
 
+    /// <summary>
+    /// Asks the model which of a course's content areas plausibly hold time-bound work.
+    /// The model only returns indices into the list it was given — it can never invent a URL.
+    /// Returns null when the call failed (callers then fall back to keyword rules).
+    /// </summary>
+    public async Task<HashSet<int>?> PickContentAreasAsync(
+        string courseName, IReadOnlyList<string> candidates, CancellationToken ct = default)
+    {
+        if (!IsConfigured || candidates.Count == 0) return null;
+
+        const string system = """
+            你是南方科技大学 Blackboard 课程结构的助手。
+            用户会给出某门课的内容区列表（编号 + 名称）。请判断哪些内容区**可能包含有截止时间的作业、测验或考试**。
+
+            只输出 JSON：{"scan":[0,3]}
+
+            规则：
+            - 只填编号，绝对不要编造不存在的编号或名称。
+            - 明显是课件、教材、往年试卷、参考资料、教师简介的不要选。
+            - 名字含糊时倾向选（宁多勿漏，漏掉作业的代价更高）。
+            - 如果全部都不像，返回 {"scan":[]}。
+            """;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"课程：{courseName}");
+        sb.AppendLine("内容区列表：");
+        for (int i = 0; i < candidates.Count && i < 40; i++)
+            sb.AppendLine($"{i}. {candidates[i]}");
+
+        var content = await RawChatAsync(system, sb.ToString(), ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(content)) return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(StripCodeFence(content));
+            if (!doc.RootElement.TryGetProperty("scan", out var arr) ||
+                arr.ValueKind != JsonValueKind.Array) return null;
+
+            var picked = new HashSet<int>();
+            foreach (var el in arr.EnumerateArray())
+                if (el.TryGetInt32(out var idx) && idx >= 0 && idx < candidates.Count)
+                    picked.Add(idx);
+
+            return picked;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("内容区分类返回无法解析: " + ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>Bare chat call used by non-analysis helpers (no retry, no mapping).</summary>
+    private async Task<string?> RawChatAsync(string system, string user, CancellationToken ct)
+    {
+        try
+        {
+            var url = _settings.LlmBaseUrl.TrimEnd('/') + "/chat/completions";
+            var payload = new
+            {
+                model = _settings.LlmModel,
+                temperature = 0,
+                response_format = new { type = "json_object" },
+                messages = new[]
+                {
+                    new { role = "system", content = system },
+                    new { role = "user", content = user }
+                }
+            };
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, url)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+            };
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _secrets.LlmApiKey);
+
+            using var resp = await _http.SendAsync(req, ct).ConfigureAwait(false);
+            var text = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                LastError = $"HTTP {(int)resp.StatusCode}: {Truncate(text, 160)}";
+                return null;
+            }
+
+            using var doc = JsonDocument.Parse(text);
+            return doc.RootElement.GetProperty("choices")[0]
+                      .GetProperty("message").GetProperty("content").GetString();
+        }
+        catch (Exception ex)
+        {
+            LastError = ex.Message;
+            Log.Error("LLM 调用异常", ex);
+            return null;
+        }
+    }
+
     public async Task<AnnouncementAnalysis?> AnalyzeAsync(
         Announcement a, DeadlineHit? ruleHit, CancellationToken ct = default)
     {

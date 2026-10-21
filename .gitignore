@@ -20,3 +20,7 @@ app.log*
 
 dist/
 
+
+# local HTML snapshots used as test fixtures (third-party assets)
+quipic/
+

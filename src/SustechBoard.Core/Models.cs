@@ -15,6 +15,15 @@ public sealed class Announcement
     public string Author { get; init; } = "";
     public required string ContentHash { get; init; }
 
+    /// <summary>"announcement" for the announcements tool, "content" for a course content area.</summary>
+    public string Origin { get; init; } = "announcement";
+
+    /// <summary>Human-readable provenance, e.g. "学习评价 / 我的作业".</summary>
+    public string SourceMenu { get; init; } = "";
+
+    /// <summary>Content-area item type from the icon alt ("作业" / "文件夹" / "文件" …). Ann declarations leave it empty.</summary>
+    public string ContentKind { get; init; } = "";
+
     public DateTimeOffset FirstSeen { get; set; }
     public DateTimeOffset LastChanged { get; set; }
 
@@ -135,6 +144,44 @@ public sealed class SyncResult
 
     public string? Error { get; set; }
     public bool Success => Error is null;
+}
+
+/// <summary>One link in a Blackboard course menu.</summary>
+public sealed record MenuEntry(
+    string Label,        // visible text, e.g. "我的作业"
+    string Group,        // enclosing subhead, e.g. "学习评价"
+    string Url,
+    bool IsContentArea); // true when it points at listContent.jsp
+
+/// <summary>A persisted content-area path for one course, discovered from its menu.</summary>
+public sealed class CoursePath
+{
+    public required string CourseId { get; init; }
+    public required string PathKey { get; init; }     // stable id derived from the URL
+    public required string Label { get; init; }
+    public string Group { get; init; } = "";
+    public required string Url { get; init; }
+
+    /// <summary>True when routine sync should actually fetch this area.</summary>
+    public bool Selected { get; set; }
+
+    /// <summary>How many content items the probe saw (0 = probably empty).</summary>
+    public int ItemCount { get; set; }
+
+    public DateTimeOffset DiscoveredAt { get; init; }
+    public DateTimeOffset? LastOkAt { get; set; }
+    public int FailCount { get; set; }
+
+    public string Display => Group.Length > 0 ? $"{Group} / {Label}" : Label;
+}
+
+/// <summary>Per-course discovery bookkeeping.</summary>
+public sealed class CourseRecord
+{
+    public required string Id { get; init; }
+    public required string Name { get; init; }
+    public string MenuHash { get; set; } = "";
+    public DateTimeOffset? DiscoveredAt { get; set; }
 }
 
 /// <summary>A calendar entry flattened from an announcement's events, ready for rendering.</summary>

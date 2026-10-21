@@ -40,7 +40,10 @@ public sealed class BoardDatabase : IDisposable
                     content_hash TEXT NOT NULL,
                     first_seen   TEXT NOT NULL,
                     last_changed TEXT NOT NULL,
-                    manual_archived INTEGER NOT NULL DEFAULT 0
+                    manual_archived INTEGER NOT NULL DEFAULT 0,
+                    origin       TEXT NOT NULL DEFAULT 'announcement',
+                    source_menu  TEXT NOT NULL DEFAULT '',
+                    content_kind TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS analyses (
                     ann_id       TEXT PRIMARY KEY,
@@ -49,11 +52,35 @@ public sealed class BoardDatabase : IDisposable
                     analyzed_at  TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS ix_ann_published ON announcements(published_at);
+
+                CREATE TABLE IF NOT EXISTS course_paths (
+                    course_id     TEXT NOT NULL,
+                    path_key      TEXT NOT NULL,
+                    label         TEXT NOT NULL,
+                    group_name    TEXT NOT NULL DEFAULT '',
+                    url           TEXT NOT NULL,
+                    selected      INTEGER NOT NULL DEFAULT 0,
+                    item_count    INTEGER NOT NULL DEFAULT 0,
+                    discovered_at TEXT NOT NULL,
+                    last_ok_at    TEXT,
+                    fail_count    INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (course_id, path_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS courses (
+                    id            TEXT PRIMARY KEY,
+                    name          TEXT NOT NULL,
+                    menu_hash     TEXT NOT NULL DEFAULT '',
+                    discovered_at TEXT
+                );
                 """;
             cmd.ExecuteNonQuery();
 
             // Migrate databases created before manual archiving existed.
             EnsureColumn("announcements", "manual_archived", "INTEGER NOT NULL DEFAULT 0");
+            EnsureColumn("announcements", "origin", "TEXT NOT NULL DEFAULT 'announcement'");
+            EnsureColumn("announcements", "source_menu", "TEXT NOT NULL DEFAULT ''");
+            EnsureColumn("announcements", "content_kind", "TEXT NOT NULL DEFAULT ''");
         }
     }
 
@@ -133,10 +160,160 @@ public sealed class BoardDatabase : IDisposable
         lock (_gate)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM analyses; DELETE FROM announcements;";
+            cmd.CommandText = "DELETE FROM analyses; DELETE FROM announcements; " +
+                              "DELETE FROM course_paths; DELETE FROM courses;";
             cmd.ExecuteNonQuery();
         }
-        Log.Info("已清空本地公告与分析缓存");
+        Log.Info("已清空本地公告、分析缓存与课程路径");
+    }
+
+    // ---------- course paths & discovery bookkeeping ----------
+
+    public void SaveCoursePaths(string courseId, IEnumerable<CoursePath> paths)
+    {
+        lock (_gate)
+        {
+            using var tx = _conn.BeginTransaction();
+
+            using (var del = _conn.CreateCommand())
+            {
+                del.CommandText = "DELETE FROM course_paths WHERE course_id = $cid";
+                del.Parameters.AddWithValue("$cid", courseId);
+                del.ExecuteNonQuery();
+            }
+
+            foreach (var p in paths)
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    INSERT INTO course_paths
+                        (course_id, path_key, label, group_name, url, selected,
+                         item_count, discovered_at, last_ok_at, fail_count)
+                    VALUES ($cid, $key, $label, $group, $url, $sel, $cnt, $da, $ok, $fail)
+                    """;
+                cmd.Parameters.AddWithValue("$cid", p.CourseId);
+                cmd.Parameters.AddWithValue("$key", p.PathKey);
+                cmd.Parameters.AddWithValue("$label", p.Label);
+                cmd.Parameters.AddWithValue("$group", p.Group);
+                cmd.Parameters.AddWithValue("$url", p.Url);
+                cmd.Parameters.AddWithValue("$sel", p.Selected ? 1 : 0);
+                cmd.Parameters.AddWithValue("$cnt", p.ItemCount);
+                cmd.Parameters.AddWithValue("$da", p.DiscoveredAt.ToString(IsoFormat, CultureInfo.InvariantCulture));
+                cmd.Parameters.AddWithValue("$ok", p.LastOkAt is { } okv
+                    ? okv.ToString(IsoFormat, CultureInfo.InvariantCulture) : DBNull.Value);
+                cmd.Parameters.AddWithValue("$fail", p.FailCount);
+                cmd.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+        }
+    }
+
+    public List<CoursePath> LoadCoursePaths()
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT course_id, path_key, label, group_name, url, selected,
+                       item_count, discovered_at, last_ok_at, fail_count
+                FROM course_paths
+                """;
+            using var r = cmd.ExecuteReader();
+            var list = new List<CoursePath>();
+            while (r.Read())
+            {
+                list.Add(new CoursePath
+                {
+                    CourseId = r.GetString(0),
+                    PathKey = r.GetString(1),
+                    Label = r.GetString(2),
+                    Group = r.GetString(3),
+                    Url = r.GetString(4),
+                    Selected = r.GetInt32(5) != 0,
+                    ItemCount = r.GetInt32(6),
+                    DiscoveredAt = ParseIso(r.GetString(7)) ?? DateTimeOffset.MinValue,
+                    LastOkAt = r.IsDBNull(8) ? null : ParseIso(r.GetString(8)),
+                    FailCount = r.GetInt32(9)
+                });
+            }
+            return list;
+        }
+    }
+
+    public void SetPathSelected(string courseId, string pathKey, bool selected)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText =
+                "UPDATE course_paths SET selected = $v WHERE course_id = $cid AND path_key = $key";
+            cmd.Parameters.AddWithValue("$v", selected ? 1 : 0);
+            cmd.Parameters.AddWithValue("$cid", courseId);
+            cmd.Parameters.AddWithValue("$key", pathKey);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public void RecordPathResult(string courseId, string pathKey, bool ok)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = ok
+                ? "UPDATE course_paths SET last_ok_at = $now, fail_count = 0 " +
+                  "WHERE course_id = $cid AND path_key = $key"
+                : "UPDATE course_paths SET fail_count = fail_count + 1 " +
+                  "WHERE course_id = $cid AND path_key = $key";
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.Now.ToString(IsoFormat, CultureInfo.InvariantCulture));
+            cmd.Parameters.AddWithValue("$cid", courseId);
+            cmd.Parameters.AddWithValue("$key", pathKey);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public List<CourseRecord> LoadCourseRecords()
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT id, name, menu_hash, discovered_at FROM courses";
+            using var r = cmd.ExecuteReader();
+            var list = new List<CourseRecord>();
+            while (r.Read())
+            {
+                list.Add(new CourseRecord
+                {
+                    Id = r.GetString(0),
+                    Name = r.GetString(1),
+                    MenuHash = r.GetString(2),
+                    DiscoveredAt = r.IsDBNull(3) ? null : ParseIso(r.GetString(3))
+                });
+            }
+            return list;
+        }
+    }
+
+    public void UpsertCourseRecord(CourseRecord rec)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO courses (id, name, menu_hash, discovered_at)
+                VALUES ($id, $name, $hash, $da)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    menu_hash = excluded.menu_hash,
+                    discovered_at = excluded.discovered_at
+                """;
+            cmd.Parameters.AddWithValue("$id", rec.Id);
+            cmd.Parameters.AddWithValue("$name", rec.Name);
+            cmd.Parameters.AddWithValue("$hash", rec.MenuHash ?? "");
+            cmd.Parameters.AddWithValue("$da", rec.DiscoveredAt is { } d
+                ? d.ToString(IsoFormat, CultureInfo.InvariantCulture) : DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
     }
 
     /// <summary>Inserts new rows and updates changed ones. Returns only new/changed items (with IsNew=true).</summary>
@@ -183,7 +360,8 @@ public sealed class BoardDatabase : IDisposable
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = """
                 SELECT id, course_id, course_name, title, body, published_at,
-                       author, content_hash, first_seen, last_changed, manual_archived
+                       author, content_hash, first_seen, last_changed, manual_archived,
+                       origin, source_menu, content_kind
                 FROM announcements
                 ORDER BY published_at DESC
                 """;
@@ -203,7 +381,10 @@ public sealed class BoardDatabase : IDisposable
                     ContentHash = r.GetString(7),
                     FirstSeen = ParseIso(r.GetString(8)) ?? DateTimeOffset.MinValue,
                     LastChanged = ParseIso(r.GetString(9)) ?? DateTimeOffset.MinValue,
-                    IsManuallyArchived = !r.IsDBNull(10) && r.GetInt32(10) != 0
+                    IsManuallyArchived = !r.IsDBNull(10) && r.GetInt32(10) != 0,
+                    Origin = r.IsDBNull(11) ? "announcement" : r.GetString(11),
+                    SourceMenu = r.IsDBNull(12) ? "" : r.GetString(12),
+                    ContentKind = r.IsDBNull(13) ? "" : r.GetString(13)
                 });
             }
             return list;
@@ -285,8 +466,10 @@ public sealed class BoardDatabase : IDisposable
         cmd.CommandText = """
             INSERT INTO announcements
                 (id, course_id, course_name, title, body, published_at, author,
-                 content_hash, first_seen, last_changed, manual_archived)
-            VALUES ($id, $cid, $cname, $title, $body, $pub, $author, $hash, $fs, $lc, 0)
+                 content_hash, first_seen, last_changed, manual_archived,
+                 origin, source_menu, content_kind)
+            VALUES ($id, $cid, $cname, $title, $body, $pub, $author, $hash, $fs, $lc, 0,
+                    $origin, $menu, $kind)
             """;
         AddCoreParams(cmd, a);
         cmd.Parameters.AddWithValue("$fs", a.FirstSeen.ToString(IsoFormat, CultureInfo.InvariantCulture));
@@ -301,7 +484,8 @@ public sealed class BoardDatabase : IDisposable
             UPDATE announcements SET
                 course_id = $cid, course_name = $cname, title = $title, body = $body,
                 published_at = $pub, author = $author, content_hash = $hash,
-                first_seen = $fs, last_changed = $lc
+                first_seen = $fs, last_changed = $lc,
+                origin = $origin, source_menu = $menu, content_kind = $kind
             WHERE id = $id
             """;
         AddCoreParams(cmd, a);
@@ -322,6 +506,9 @@ public sealed class BoardDatabase : IDisposable
             : DBNull.Value);
         cmd.Parameters.AddWithValue("$author", a.Author ?? "");
         cmd.Parameters.AddWithValue("$hash", a.ContentHash);
+        cmd.Parameters.AddWithValue("$origin", string.IsNullOrEmpty(a.Origin) ? "announcement" : a.Origin);
+        cmd.Parameters.AddWithValue("$menu", a.SourceMenu ?? "");
+        cmd.Parameters.AddWithValue("$kind", a.ContentKind ?? "");
     }
 
     private void Touch(string id, DateTimeOffset now)

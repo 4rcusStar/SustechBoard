@@ -39,6 +39,15 @@ public sealed class AppSettings
     public string LlmBaseUrl { get; set; } = "https://api.deepseek.com/v1";
     public string LlmModel { get; set; } = "deepseek-chat";
 
+    /// <summary>Also crawl course content areas (e.g. 学习评价 / 我的作业) besides announcements.</summary>
+    public bool ContentScanEnabled { get; set; } = true;
+
+    /// <summary>Days between automatic full rescans of every course menu.</summary>
+    public int FullScanIntervalDays { get; set; } = 7;
+
+    /// <summary>Upper bound on content areas fetched per course per sync.</summary>
+    public int MaxContentAreasPerCourse { get; set; } = 3;
+
     public bool LaunchAtStartup { get; set; } = false;
 
     /// <summary>Days considered "urgent" (P0).</summary>
