@@ -117,6 +117,11 @@ public partial class App : Application
         var menu = new WinForms.ContextMenuStrip { ShowImageMargin = false };
         menu.Items.Add("显示面板", null, (_, _) => ShowPanel());
         menu.Items.Add("立即刷新", null, async (_, _) => await DoSyncAsync(false));
+        menu.Items.Add("重新扫描课程结构", null, async (_, _) =>
+        {
+            _sync?.RequestFullScan();
+            await DoSyncAsync(false);
+        });
         menu.Items.Add("设置", null, (_, _) => OpenSettings());
         menu.Items.Add(new WinForms.ToolStripSeparator());
         menu.Items.Add("退出", null, (_, _) => RequestShutdown());
