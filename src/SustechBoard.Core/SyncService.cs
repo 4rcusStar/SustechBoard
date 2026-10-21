@@ -1,3 +1,6 @@
+using System.Text;
+using System.Text.RegularExpressions;
+
 namespace SustechBoard.Core;
 
 /// <summary>
@@ -86,18 +89,24 @@ public sealed class SyncService : IDisposable
         return records.Any(r => r.DiscoveredAt is null || r.DiscoveredAt < cutoff);
     }
 
-    private static bool LooksLikeWork(string label) =>
-        new[] { "作业", "assignment", "homework", "quiz", "test", "exam",
-                "考试", "测验", "任务", "评价", "assessment" }
-            .Any(k => label.Contains(k, StringComparison.OrdinalIgnoreCase));
-
     /// <summary>
-    /// Tier A: read a course menu, let the model (or keyword rules) choose which content
-    /// areas are worth crawling, probe the chosen ones, and persist the result.
+    /// Tier A: probe the content areas and keep the ones whose item text actually carries a
+    /// deadline. Labels and icons lie — a course can hide "HW1 Force Vectors / Due: 14 September"
+    /// inside a section named "Chapter 2" — so selection is driven by content, not by wording.
     /// </summary>
     private async Task DiscoverCourseAsync(CourseInfo course, List<MenuEntry>? menu, CancellationToken ct)
     {
         menu ??= await _fetcher.GetCourseMenuAsync(course, ct).ConfigureAwait(false);
+
+        // A failed fetch must never be mistaken for "this course has no content areas":
+        // that would erase paths we already know are good.
+        if (menu is null)
+        {
+            var existing = _db.LoadCoursePaths().Where(p => p.CourseId == course.Id).ToList();
+            Log.Warn($"{course.Name}: 课程页抓取失败，保留原有 {existing.Count} 条路径");
+            return;
+        }
+
         var candidates = menu.Where(m => m.IsContentArea).ToList();
         var now = DateTimeOffset.Now;
 
@@ -111,50 +120,82 @@ public sealed class SyncService : IDisposable
             DiscoveredAt = now
         }).ToList();
 
-        if (paths.Count > 0)
+        if (paths.Count == 0)
         {
-            var labels = paths.Select(p => p.Display).ToList();
-
-            HashSet<int>? picked = null;
-            if (_llm.IsConfigured)
-                picked = await _llm.PickContentAreasAsync(course.Name, labels, ct).ConfigureAwait(false);
-
-            picked ??= new HashSet<int>(
-                Enumerable.Range(0, labels.Count).Where(i => LooksLikeWork(labels[i])));
-
-            var pickedList = picked.OrderBy(i => i).ToList();
-
-            // Safety net: if the model found nothing, still probe the two best keyword hits
-            // rather than silently scanning nothing at all.
-            if (pickedList.Count == 0)
-            {
-                pickedList = Enumerable.Range(0, labels.Count)
-                                       .Where(i => LooksLikeWork(labels[i]))
-                                       .Take(2)
-                                       .ToList();
-                if (pickedList.Count > 0)
-                    Log.Warn($"{course.Name}: 模型未选出内容区，回退关键字猜测");
-            }
-
-            var capped = pickedList.Take(Math.Max(1, _settings.MaxContentAreasPerCourse)).ToList();
-
-            foreach (var i in capped)
-            {
-                if (ct.IsCancellationRequested) break;
-
-                var p = paths[i];
-                var items = await _fetcher.FetchContentAreaAsync(course, p, ct).ConfigureAwait(false);
-                if (items is null) continue;
-
-                p.ItemCount = items.Count;
-
-                // Ground truth beats guessing: an area counts only if it really holds work.
-                var hasWork = items.Any(a => a.ContentKind is "作业" or "测验" or "考试" or "测试");
-                p.Selected = hasWork || (items.Count > 0 && LooksLikeWork(p.Display));
-                if (p.Selected) p.LastOkAt = DateTimeOffset.Now;
-            }
+            SaveDiscovery(course, paths, menu, now);
+            Log.Info($"{course.Name}: 无内容区");
+            return;
         }
 
+        // Probe every candidate: the only way to know what is actually inside.
+        var probedItems = new Dictionary<string, List<Announcement>>(StringComparer.Ordinal);
+        var probed = 0;
+
+        foreach (var p in paths)
+        {
+            if (ct.IsCancellationRequested) break;
+            if (probed >= Math.Max(1, _settings.MaxProbesPerCourse)) break;
+            probed++;
+
+            var items = await _fetcher.FetchContentAreaAsync(course, p, ct).ConfigureAwait(false);
+            if (items is null) continue;
+
+            p.ItemCount = items.Count;
+            probedItems[p.PathKey] = items;
+        }
+
+        // Every probe failed → the session is probably broken, not the course. Keep old paths.
+        if (paths.Count > 0 && probedItems.Count == 0)
+        {
+            var existing = _db.LoadCoursePaths().Where(p => p.CourseId == course.Id).ToList();
+            Log.Warn($"{course.Name}: 全部内容区探测失败，保留原有 {existing.Count} 条路径");
+            return;
+        }
+
+        // Let the model decide from the real item text, not from the menu wording.
+        HashSet<int>? keepIdx = null;
+        if (_llm.IsConfigured)
+        {
+            var digests = paths
+                .Select(p => BuildAreaDigest(p, probedItems.GetValueOrDefault(p.PathKey)))
+                .ToList();
+            keepIdx = await _llm.ClassifyContentAreasAsync(course.Name, digests, ct).ConfigureAwait(false);
+        }
+
+        if (keepIdx is not null)
+        {
+            for (int i = 0; i < paths.Count; i++) paths[i].Selected = keepIdx.Contains(i);
+        }
+        else
+        {
+            // No model configured: coarse local fallback so the feature still works.
+            foreach (var p in paths)
+                p.Selected = probedItems.TryGetValue(p.PathKey, out var its) && LooksLikeWorkFallback(its);
+        }
+
+        // Cap so routine sync stays cheap; the richest areas win.
+        var cap = Math.Max(1, _settings.MaxContentAreasPerCourse);
+        var keep = paths.Where(p => p.Selected)
+                        .OrderByDescending(p => probedItems.GetValueOrDefault(p.PathKey)?.Count ?? 0)
+                        .Take(cap)
+                        .Select(p => p.PathKey)
+                        .ToHashSet();
+
+        foreach (var p in paths)
+        {
+            p.Selected = keep.Contains(p.PathKey);
+            if (p.Selected) p.LastOkAt = DateTimeOffset.Now;
+        }
+
+        foreach (var p in paths.Where(x => x.Selected))
+            Log.Info($"    ✓ {p.Display}: {p.ItemCount} 条");
+
+        SaveDiscovery(course, paths, menu, now);
+        Log.Info($"{course.Name}: 内容区 {paths.Count} 个，探测 {probed} 个，选中 {paths.Count(p => p.Selected)} 个");
+    }
+
+    private void SaveDiscovery(CourseInfo course, List<CoursePath> paths, List<MenuEntry> menu, DateTimeOffset now)
+    {
         _db.SaveCoursePaths(course.Id, paths);
         _db.UpsertCourseRecord(new CourseRecord
         {
@@ -163,9 +204,33 @@ public sealed class SyncService : IDisposable
             MenuHash = MenuHash(menu),
             DiscoveredAt = now
         });
-
-        Log.Info($"{course.Name}: 内容区 {paths.Count} 个，探测选中 {paths.Count(p => p.Selected)} 个");
     }
+
+    /// <summary>Compact per-area summary handed to the model for the keep/drop decision.</summary>
+    private static string BuildAreaDigest(CoursePath p, List<Announcement>? items)
+    {
+        var sb = new StringBuilder();
+        sb.Append($"{p.Display}  （{items?.Count ?? 0} 条）");
+        if (items is null || items.Count == 0) return sb.ToString();
+
+        foreach (var it in items.Take(6))
+        {
+            var snippet = it.Body.Length > 150 ? it.Body[..150] : it.Body;
+            sb.AppendLine();
+            sb.Append($"    - {it.Title} | {it.ContentKind} | {snippet}");
+        }
+        if (items.Count > 6) sb.Append($"\n    … 另有 {items.Count - 6} 条");
+        return sb.ToString();
+    }
+
+    /// <summary>Degraded selection used only when no model is configured.</summary>
+    private static bool LooksLikeWorkFallback(List<Announcement> items) =>
+        items.Any(i =>
+            i.ContentKind.Contains("作业", StringComparison.Ordinal) ||
+            i.ContentKind.Contains("Assignment", StringComparison.OrdinalIgnoreCase) ||
+            i.ContentKind.Contains("Test", StringComparison.OrdinalIgnoreCase) ||
+            i.ContentKind.Contains("Exam", StringComparison.OrdinalIgnoreCase) ||
+            Regex.IsMatch(i.Body, @"\bdue\b|deadline|截止", RegexOptions.IgnoreCase));
 
     /// <summary>
     /// Flattens every announcement's events into calendar entries.
@@ -321,6 +386,11 @@ public sealed class SyncService : IDisposable
             var fetchComplete = courses.Count > 0;
             var staleStructure = new List<(CourseInfo Course, List<MenuEntry> Menu)>();
 
+            // Reconciliation is scoped per course: a partial course list must not delete
+            // whole courses that simply were not returned this time.
+            var perCourseIds = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            var perCourseComplete = new Dictionary<string, bool>(StringComparer.Ordinal);
+
             foreach (var c in courses)
             {
                 if (ct.IsCancellationRequested) break;
@@ -329,16 +399,23 @@ public sealed class SyncService : IDisposable
                 if (items is null)
                 {
                     fetchComplete = false;   // partial fetch — never reconcile on this
+                    perCourseComplete[c.Id] = false;
                     continue;
                 }
                 all.AddRange(items);
+                perCourseIds[c.Id] = items.Select(x => x.Id).ToList();
+                perCourseComplete[c.Id] = true;
 
                 // Structure changed under us? Rediscover this course before reading its areas.
                 if (_settings.ContentScanEnabled)
                 {
                     var rec = records.FirstOrDefault(r => r.Id == c.Id);
                     var hash = MenuHash(menu);
-                    if (rec is not null && rec.MenuHash.Length > 0 && rec.MenuHash != hash)
+
+                    // Only a menu that actually lists content areas can be a real structure
+                    // change; an empty parse almost always means a bad response.
+                    if (rec is not null && rec.MenuHash.Length > 0 && rec.MenuHash != hash &&
+                        menu.Any(m => m.IsContentArea))
                     {
                         Log.Info($"{c.Name}: 菜单结构变化，重新发现内容区");
                         staleStructure.Add((c, menu));
@@ -376,10 +453,16 @@ public sealed class SyncService : IDisposable
                             {
                                 _db.RecordPathResult(c.Id, path.PathKey, false);
                                 fetchComplete = false;
+                                perCourseComplete[c.Id] = false;
                                 continue;
                             }
                             _db.RecordPathResult(c.Id, path.PathKey, true);
                             all.AddRange(content);
+
+                            if (!perCourseIds.TryGetValue(c.Id, out var ids))
+                                perCourseIds[c.Id] = ids = new List<string>();
+                            ids.AddRange(content.Select(x => x.Id));
+
                             Log.Info($"  {c.Name} · {path.Display}: {content.Count} 条");
                         }
                     }
@@ -397,20 +480,24 @@ public sealed class SyncService : IDisposable
             result.NewOrChanged = changed;
             AnnouncementCount = all.Count;
 
-            // Reconcile removals so a switched account (or a dropped course) leaves nothing behind.
-            if (fetchComplete)
+            // Reconcile removals course by course: only a course that fetched completely
+            // is allowed to have rows deleted, so a flaky course list cannot wipe data.
+            var removed = 0;
+            foreach (var (courseId, complete) in perCourseComplete)
             {
-                var removed = _db.DeleteNotIn(all.Select(a => a.Id).ToList());
-                if (removed > 0)
-                    Log.Info($"清理 {removed} 条本次未返回的旧公告（换号或退课）");
+                if (!complete) continue;
+                if (!perCourseIds.TryGetValue(courseId, out var ids)) continue;
+                removed += _db.DeleteNotInCourse(courseId, ids);
+            }
 
-                result.RemovedCount = removed;
-                _db.PruneOrphanAnalyses();
-            }
-            else
-            {
-                Log.Warn("本次抓取不完整，跳过旧公告清理");
-            }
+            if (removed > 0)
+                Log.Info($"清理 {removed} 条本次未返回的旧公告（换号或退课）");
+
+            result.RemovedCount = removed;
+            _db.PruneOrphanAnalyses();
+
+            if (!fetchComplete)
+                Log.Warn("本次部分抓取失败，相关课程保留旧数据不做清理");
 
             // Ensure every announcement has at least a rule-layer analysis.
             StatusChanged?.Invoke("正在分析…");

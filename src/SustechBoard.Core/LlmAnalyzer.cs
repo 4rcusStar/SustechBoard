@@ -135,46 +135,58 @@ public sealed class LlmAnalyzer : IDisposable
     }
 
     /// <summary>
-    /// Asks the model which of a course's content areas plausibly hold time-bound work.
-    /// The model only returns indices into the list it was given — it can never invent a URL.
-    /// Returns null when the call failed (callers then fall back to keyword rules).
+    /// Decides which content areas hold graded work, judging from the items actually inside them
+    /// rather than from the menu wording. One call per course; the model returns indices only.
+    /// Returns null when the call failed.
     /// </summary>
-    public async Task<HashSet<int>?> PickContentAreasAsync(
-        string courseName, IReadOnlyList<string> candidates, CancellationToken ct = default)
+    public async Task<HashSet<int>?> ClassifyContentAreasAsync(
+        string courseName, IReadOnlyList<string> areaDigests, CancellationToken ct = default)
     {
-        if (!IsConfigured || candidates.Count == 0) return null;
+        if (!IsConfigured || areaDigests.Count == 0) return null;
 
         const string system = """
-            你是南方科技大学 Blackboard 课程结构的助手。
-            用户会给出某门课的内容区列表（编号 + 名称）。请判断哪些内容区**可能包含有截止时间的作业、测验或考试**。
+            你是南方科技大学 Blackboard 课程的助手。用户会给出某门课若干「内容区」，
+            每个区下列出它实际包含的条目（标题 | 类型 | 说明片段 | 附件名）。
 
-            只输出 JSON：{"scan":[0,3]}
+            你的任务：判断哪些内容区包含**需要学生提交或参加、且有截止时间的东西**
+            ——作业、实验、小测、期中/期末、需要上交的报告等。
 
-            规则：
-            - 只填编号，绝对不要编造不存在的编号或名称。
-            - 明显是课件、教材、往年试卷、参考资料、教师简介的不要选。
-            - 名字含糊时倾向选（宁多勿漏，漏掉作业的代价更高）。
-            - 如果全部都不像，返回 {"scan":[]}。
+            只输出 JSON：{"keep":[0,3]}
+
+            判断要点：
+            - 看条目标题和说明，不要只看区名。"Chapter 2" 里可能有 "HW1 Force Vectors / Due: ..."。
+            - 纯课件、教材、Past exam papers、教师简介、课程大纲 → 不要。
+            - "Homework Solution / 作业答案" 是答案，不是作业本身 → 需要你自己判断，若一个区里既有作业又有答案，保留该区。
+            - 只要区里**至少有一个**条目像作业/测验/考试，就保留该区。
+            - 宁可多留，漏掉作业的代价远大于多抓一个区。
+            - 只填编号，不要编造。
             """;
 
         var sb = new StringBuilder();
         sb.AppendLine($"课程：{courseName}");
-        sb.AppendLine("内容区列表：");
-        for (int i = 0; i < candidates.Count && i < 40; i++)
-            sb.AppendLine($"{i}. {candidates[i]}");
+        sb.AppendLine();
 
-        var content = await RawChatAsync(system, sb.ToString(), ct).ConfigureAwait(false);
+        for (int i = 0; i < areaDigests.Count; i++)
+        {
+            sb.AppendLine($"[{i}] {areaDigests[i]}");
+            sb.AppendLine();
+        }
+
+        var user = sb.ToString();
+        if (user.Length > 12000) user = user[..12000];
+
+        var content = await RawChatAsync(system, user, ct).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(content)) return null;
 
         try
         {
             using var doc = JsonDocument.Parse(StripCodeFence(content));
-            if (!doc.RootElement.TryGetProperty("scan", out var arr) ||
+            if (!doc.RootElement.TryGetProperty("keep", out var arr) ||
                 arr.ValueKind != JsonValueKind.Array) return null;
 
             var picked = new HashSet<int>();
             foreach (var el in arr.EnumerateArray())
-                if (el.TryGetInt32(out var idx) && idx >= 0 && idx < candidates.Count)
+                if (el.TryGetInt32(out var idx) && idx >= 0 && idx < areaDigests.Count)
                     picked.Add(idx);
 
             return picked;

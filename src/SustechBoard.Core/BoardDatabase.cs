@@ -122,20 +122,21 @@ public sealed class BoardDatabase : IDisposable
     }
 
     /// <summary>
-    /// Deletes announcements that this fetch did not return. Without this, switching accounts
-    /// (or dropping a course) leaves the previous account's rows in the panel forever.
-    /// Callers must only invoke this after a *complete* fetch.
+    /// Deletes announcements of ONE course that this fetch did not return.
+    /// Scoped per course on purpose: if the course list itself comes back partial (a flaky
+    /// AJAX response), a global diff would delete whole courses that simply weren't fetched.
     /// </summary>
-    public int DeleteNotIn(IReadOnlyCollection<string> keepIds)
+    public int DeleteNotInCourse(string courseId, IReadOnlyCollection<string> keepIds)
     {
-        // Refuse to wipe everything on an obviously empty/failed fetch.
         if (keepIds.Count == 0) return 0;
 
         lock (_gate)
         {
             var placeholders = string.Join(",", keepIds.Select((_, i) => "$p" + i));
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = $"DELETE FROM announcements WHERE id NOT IN ({placeholders})";
+            cmd.CommandText =
+                $"DELETE FROM announcements WHERE course_id = $cid AND id NOT IN ({placeholders})";
+            cmd.Parameters.AddWithValue("$cid", courseId);
             var i = 0;
             foreach (var id in keepIds) cmd.Parameters.AddWithValue("$p" + i++, id);
             return cmd.ExecuteNonQuery();

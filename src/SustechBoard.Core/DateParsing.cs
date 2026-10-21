@@ -36,10 +36,18 @@ public static class DateParsing
     private static readonly Regex IsoDate = new(
         @"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)", RegexOptions.Compiled);
 
-    // November 8th, 2026 / Nov 2
+    // November 8th, 2026 / Nov 2  — the (?!\d) stops "Oct 2026" being read as day 20.
     private static readonly Regex EnMonth = new(
         @"\b(January|February|March|April|May|June|July|August|September|October|November|December|" +
-        @"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?" +
+        @"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep(?:t)?|Oct|Nov|Dec)\.?\s+(\d{1,2})(?!\d)(?:st|nd|rd|th)?" +
+        @"(?:\s*,?\s*(\d{4}))?",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // 14 September 2026 / 14 Sept / Monday, 14 September 2026
+    private static readonly Regex EnDayFirst = new(
+        @"(?<!\d)(\d{1,2})(?!\d)(?:st|nd|rd|th)?\s+" +
+        @"(January|February|March|April|May|June|July|August|September|October|November|December|" +
+        @"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep(?:t)?|Oct|Nov|Dec)\.?" +
         @"(?:\s*,?\s*(\d{4}))?",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
@@ -161,6 +169,16 @@ public static class DateParsing
             if (Overlaps(taken, m.Index)) continue;
             if (!TryMonth(m.Groups[1].Value, out var mo)) continue;
             if (!int.TryParse(m.Groups[2].Value, out var d) || d is < 1 or > 31) continue;
+            int year = m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : 0;
+            Consider(m.Index, m.Index + m.Length, year, mo, d, m.Groups[3].Success);
+        }
+
+        // Day-first English: "Due: Monday, 14 September 2026"
+        foreach (Match m in EnDayFirst.Matches(body))
+        {
+            if (Overlaps(taken, m.Index)) continue;
+            if (!int.TryParse(m.Groups[1].Value, out var d) || d is < 1 or > 31) continue;
+            if (!TryMonth(m.Groups[2].Value, out var mo)) continue;
             int year = m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : 0;
             Consider(m.Index, m.Index + m.Length, year, mo, d, m.Groups[3].Success);
         }

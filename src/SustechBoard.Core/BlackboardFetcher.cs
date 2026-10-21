@@ -118,8 +118,12 @@ public sealed class BlackboardFetcher
             : BlackboardClient.BbBase + "/" + href;
     }
 
-    /// <summary>Fetches one course page and returns its parsed menu.</summary>
-    public async Task<List<MenuEntry>> GetCourseMenuAsync(CourseInfo course, CancellationToken ct = default)
+    /// <summary>
+    /// Fetches one course page and returns its parsed menu.
+    /// Returns null when the request failed, so callers can tell "fetch broke" from
+    /// "this course really has no menu" — mistaking the former for the latter wipes good data.
+    /// </summary>
+    public async Task<List<MenuEntry>?> GetCourseMenuAsync(CourseInfo course, CancellationToken ct = default)
     {
         var url = BlackboardClient.BbBase + "/webapps/blackboard/execute/announcement" +
                   "?method=search&context=course_entry" +
@@ -127,7 +131,9 @@ public sealed class BlackboardFetcher
                   "&handle=announcements_entry&mode=view";
 
         var html = await _client.GetStringAsync(url, ct).ConfigureAwait(false);
-        return html is null ? new List<MenuEntry>() : ParseCourseMenu(html);
+        if (html is null) return null;
+
+        return ParseCourseMenu(html);
     }
 
     /// <summary>
@@ -239,26 +245,36 @@ public sealed class BlackboardFetcher
 
             var kind = li.QuerySelector("img.item_icon")?.GetAttribute("alt")?.Trim() ?? "";
 
+            // Inline <script> blobs sit inside the details block; left in, they eat the whole
+            // character budget and push the real "Due: …" line out of the captured text.
+            foreach (var junk in li.QuerySelectorAll("script, style").ToList())
+                junk.Remove();
+
             var parts = new List<string>();
             if (kind.Length > 0) parts.Add($"【{kind}】");
 
-            var bodyEl = li.QuerySelector("div.vtbegenerated");
-            if (bodyEl is not null)
-            {
-                var text = Collapse(bodyEl.TextContent);
-                if (text.Length > 0) parts.Add(text);
-            }
+            // The due date is not always inside div.vtbegenerated — Blackboard also renders it
+            // as a detailsLabel/detailsValue pair ("Due: Monday, 14 September 2026").
+            // Take the whole details block so nothing is missed, then cap for the model's sake.
+            var detailsEl = li.QuerySelector("div.details");
+            var textSource = detailsEl?.TextContent
+                             ?? li.QuerySelector("div.vtbegenerated")?.TextContent
+                             ?? "";
+
+            var text = Collapse(textSource);
+            if (text.Length > 800) text = text[..800];
+            if (text.Length > 0) parts.Add(text);
 
             // Attachment names often carry the assignment title (hw3.pdf) — useful signal.
             var attachments = li.QuerySelectorAll("ul.attachments li a")
                 .Select(x => Collapse(x.TextContent))
                 .Where(x => x.Length > 0)
-                .Take(5)
+                .Take(6)
                 .ToList();
-            if (attachments.Count > 0) parts.Add("附件: " + string.Join("; ", attachments));
 
             var body = string.Join(" ", parts);
-            if (body.Length == 0) body = title;
+            if (attachments.Count > 0) body += " 附件: " + string.Join("; ", attachments);
+            if (body.Trim().Length == 0) body = title;
 
             items.Add(new Announcement
             {

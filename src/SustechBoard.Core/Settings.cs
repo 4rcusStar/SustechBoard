@@ -46,7 +46,10 @@ public sealed class AppSettings
     public int FullScanIntervalDays { get; set; } = 7;
 
     /// <summary>Upper bound on content areas fetched per course per sync.</summary>
-    public int MaxContentAreasPerCourse { get; set; } = 3;
+    public int MaxContentAreasPerCourse { get; set; } = 12;
+
+    /// <summary>Upper bound on content areas probed during one discovery run, per course.</summary>
+    public int MaxProbesPerCourse { get; set; } = 30;
 
     public bool LaunchAtStartup { get; set; } = false;
 

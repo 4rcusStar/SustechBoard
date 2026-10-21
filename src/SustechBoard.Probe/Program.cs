@@ -30,6 +30,29 @@ if (args.Length >= 1 && args[0] == "--dump")
     return 0;
 }
 
+// Dev helper: search stored announcements (and their analysis) by keyword.
+if (args.Length >= 2 && args[0] == "--find")
+{
+    using var fdDb = new BoardDatabase();
+    var fdAll = fdDb.LoadAll();
+    var fdAn = fdDb.LoadAnalyses();
+    var kw = args[1];
+    var hits = fdAll.Where(a =>
+        a.Title.Contains(kw, StringComparison.OrdinalIgnoreCase) ||
+        a.CourseName.Contains(kw, StringComparison.OrdinalIgnoreCase)).ToList();
+
+    Console.WriteLine($"匹配 {hits.Count} 条");
+    foreach (var a in hits)
+    {
+        fdAn.TryGetValue(a.Id, out var an);
+        var dl = an?.Deadline is { } d ? d.ToString("yyyy-MM-dd HH:mm") : "—";
+        Console.WriteLine($"[{a.Origin,-12}] {a.CourseName} | {a.Title}");
+        Console.WriteLine($"     src={a.SourceMenu}  kind={a.ContentKind}  截止={dl} conf={an?.DeadlineConfidence:0.00} label={an?.Label}");
+        Console.WriteLine($"     正文: {Trunc(a.Body, 150)}");
+    }
+    return 0;
+}
+
 // Dev helper: forget all discovered course paths so the next sync rescans every menu.
 if (args.Length >= 1 && args[0] == "--reset-discovery")
 {
@@ -78,6 +101,7 @@ if (args.Length >= 2 && args[0] == "--probe-areas")
 
     Console.WriteLine($"课程: {target.Name} ({target.Id})");
     var paMenu = await paFetcher.GetCourseMenuAsync(target);
+    if (paMenu is null) { Console.WriteLine("菜单抓取失败"); return 1; }
     var areas = paMenu.Where(m => m.IsContentArea).ToList();
     Console.WriteLine($"内容区 {areas.Count} 个");
 
@@ -124,6 +148,7 @@ if (args.Length >= 1 && args[0] == "--discover")
     foreach (var c in dvCourses)
     {
         var menu = await dvFetcher.GetCourseMenuAsync(c);
+        if (menu is null) { Console.WriteLine($"=== {c.Name} ({c.Id}): 菜单抓取失败"); continue; }
         var content = menu.Where(m => m.IsContentArea).ToList();
         Console.WriteLine();
         Console.WriteLine($"=== {c.Name}  ({c.Id})  menu={menu.Count}  contentAreas={content.Count}");
