@@ -5,16 +5,6 @@ using System.Text.Json.Serialization;
 
 namespace SustechBoard.Core;
 
-/// <summary>How the panel behaves in the window Z-order.</summary>
-public enum PanelDisplayMode
-{
-    /// <summary>Comes to the front while it has focus, drops back otherwise.</summary>
-    TopmostWhenFocused = 0,
-
-    /// <summary>Never stays on top; sinks below other windows once it loses focus.</summary>
-    AlwaysBottom = 1
-}
-
 public sealed class AppSettings
 {
     public const string DefaultService =
@@ -62,8 +52,6 @@ public sealed class AppSettings
     public double PanelHeight { get; set; } = 560;
     public double PanelLeft { get; set; } = -1;
     public double PanelTop { get; set; } = -1;
-
-    public PanelDisplayMode DisplayMode { get; set; } = PanelDisplayMode.TopmostWhenFocused;
 
     public AppSettings Clone() => (AppSettings)MemberwiseClone();
 }

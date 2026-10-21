@@ -50,11 +50,6 @@ public partial class SettingsWindow : Window
 
         StartupCheck.IsChecked = StartupManager.IsEnabled();
 
-        if (settings.DisplayMode == PanelDisplayMode.AlwaysBottom)
-            DispAlwaysBottom.IsChecked = true;
-        else
-            DispFocusTop.IsChecked = true;
-
         UpdateSaveState();
     }
 
@@ -165,10 +160,6 @@ public partial class SettingsWindow : Window
         _settings.LlmBaseUrl = LlmBaseBox.Text.Trim();
         _settings.LlmModel = LlmModelBox.Text.Trim();
         _secrets.LlmApiKey = LlmKeyBox.Password.Trim();
-
-        _settings.DisplayMode = DispAlwaysBottom.IsChecked == true
-            ? PanelDisplayMode.AlwaysBottom
-            : PanelDisplayMode.TopmostWhenFocused;
 
         var wantStartup = StartupCheck.IsChecked == true;
         if (wantStartup != StartupManager.IsEnabled()) StartupManager.Set(wantStartup);

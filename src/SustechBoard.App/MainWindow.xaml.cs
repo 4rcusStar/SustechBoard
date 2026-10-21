@@ -53,21 +53,61 @@ public partial class MainWindow : Window
     // ---------- display mode ----------
 
     /// <summary>Applies the configured Z-order behaviour. Safe to call at any time.</summary>
+    // ---------- normal behaviour + lock ----------
+
+    /// <summary>Window is a plain, non-topmost window. Z-order is only affected by the lock.</summary>
     public void ApplyDisplayMode()
     {
-        if (_settings.DisplayMode == PanelDisplayMode.TopmostWhenFocused)
+        Topmost = false;
+        if (IsLocked) SendToBottom();
+        Log.Info($"面板状态: {(IsLocked ? "已锁定" : "正常")}  尺寸: {Width:0}x{Height:0}");
+    }
+
+    /// <summary>True while the panel is pinned to the desktop bottom with interaction disabled.</summary>
+    public bool IsLocked { get; private set; }
+
+    private void Lock_Click(object sender, RoutedEventArgs e) => SetLocked(!IsLocked);
+
+    /// <summary>
+    /// Pins the panel to the very bottom of the Z-order and disables everything except the lock
+    /// button itself, so the user can only bring it back by clicking the lock while the desktop
+    /// is showing.
+    /// </summary>
+    public void SetLocked(bool locked)
+    {
+        IsLocked = locked;
+
+        LockButton.Content = locked ? "🔒" : "🔓";
+        LockButton.ToolTip = locked
+            ? "已锁定：切到桌面后点击此图标解锁"
+            : "锁定：沉到桌面最底部并禁用交互";
+
+        // Everything except the lock stops responding to the mouse.
+        TabPanel.IsHitTestVisible = !locked;
+        ContentHost.IsHitTestVisible = !locked;
+        FooterBar.IsHitTestVisible = !locked;
+
+        RefreshButton.IsEnabled = !locked;
+        SettingsButton.IsEnabled = !locked;
+        CloseButton.IsEnabled = !locked;
+
+        // Dim slightly so the locked state is obvious.
+        RootBorder.Opacity = locked ? 0.72 : 1.0;
+
+        Topmost = false;
+        if (locked)
         {
-            Topmost = IsActive;
+            SendToBottom();
+            Log.Info("面板已锁定（沉底 + 禁用交互）");
         }
         else
         {
-            Topmost = false;
-            SendToBottom();
+            BringToFront();
+            Log.Info("面板已解锁");
         }
-        Log.Info($"显示模式: {_settings.DisplayMode}  尺寸: {Width:0}x{Height:0}");
     }
 
-    /// <summary>Explicit user request (tray click): surface the panel even in bottom mode.</summary>
+    /// <summary>Explicit user request (tray click): surface the panel.</summary>
     public void BringToFront()
     {
         var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
@@ -91,17 +131,9 @@ public partial class MainWindow : Window
     protected override void OnActivated(EventArgs e)
     {
         base.OnActivated(e);
-        if (_settings.DisplayMode == PanelDisplayMode.TopmostWhenFocused)
-            Topmost = true;
-    }
 
-    protected override void OnDeactivated(EventArgs e)
-    {
-        base.OnDeactivated(e);
-        if (_settings.DisplayMode == PanelDisplayMode.TopmostWhenFocused)
-            Topmost = false;
-        else
-            SendToBottom();
+        // A locked panel must never rise above other windows.
+        if (IsLocked) SendToBottom();
     }
 
     private void PositionWindow()
@@ -219,6 +251,7 @@ public partial class MainWindow : Window
 
     private void Header_MouseDown(object sender, MouseButtonEventArgs e)
     {
+        if (IsLocked) return;   // a locked panel must not be draggable
         if (e.ButtonState == MouseButtonState.Pressed) DragMove();
     }
 

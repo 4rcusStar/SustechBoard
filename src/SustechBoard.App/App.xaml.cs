@@ -134,6 +134,13 @@ public partial class App : Application
     private void ShowPanel()
     {
         if (_panel is null) return;
+
+        if (_panel.IsLocked)
+        {
+            Notify("SustechBoard", "面板已锁定，请在桌面上点击锁图标解锁");
+            return;
+        }
+
         _panel.WindowState = WindowState.Normal;
         _panel.BringToFront();
     }

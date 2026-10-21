@@ -210,17 +210,6 @@
                                    TextWrapping="Wrap" MaxWidth="250"/>
                     </StackPanel>
 
-                    <TextBlock Text="显示" Style="{StaticResource SectionTitle}"/>
-                    <TextBlock Foreground="{StaticResource TextMuted}" FontSize="10"
-                               Margin="0,3,0,2" TextWrapping="Wrap"
-                               Text="面板可拖拽边框缩放，界面会自动适应宽度。"/>
-                    <RadioButton x:Name="DispFocusTop" GroupName="Disp"
-                                 Style="{StaticResource DarkRadio}"
-                                 Content="仅 focus 的时候在最上"/>
-                    <RadioButton x:Name="DispAlwaysBottom" GroupName="Disp"
-                                 Style="{StaticResource DarkRadio}"
-                                 Content="随时在最下层"/>
-
                     <TextBlock Text="系统" Style="{StaticResource SectionTitle}"/>
                     <CheckBox x:Name="StartupCheck" Content="开机自动启动（最小化到托盘）"
                               Style="{StaticResource DarkCheck}"/>
