@@ -1,0 +1,19 @@
+# Build output
+bin/
+obj/
+publish/
+publish-standalone/
+publish-selfcontained/
+
+# IDE
+.vs/
+*.user
+*.suo
+
+# Local runtime data — never commit credentials or scraped content
+*.db
+*.db-shm
+*.db-wal
+secrets.dat
+settings.json
+app.log*
