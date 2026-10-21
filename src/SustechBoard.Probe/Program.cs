@@ -58,6 +58,16 @@ if (args.Length >= 1 && args[0] == "--selftest-switch")
     return ok ? 0 : 1;
 }
 
+// Dev helper: list course records with their enabled flag.
+if (args.Length >= 1 && args[0] == "--list-courses")
+{
+    using var lcDb = new BoardDatabase();
+    foreach (var c in lcDb.LoadCourseRecords().OrderBy(c => c.Name))
+        Console.WriteLine($"{(c.Enabled ? "[✓]" : "[ ]")} {c.Id,-10} {c.Name}");
+    Console.WriteLine($"selection done = {lcDb.GetMeta("course_selection_done")}");
+    return 0;
+}
+
 // Dev helper: show which rows the dedup pass folded away.
 if (args.Length >= 1 && args[0] == "--list-dups")
 {

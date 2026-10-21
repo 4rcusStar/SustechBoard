@@ -71,7 +71,8 @@ public sealed class BoardDatabase : IDisposable
                     id            TEXT PRIMARY KEY,
                     name          TEXT NOT NULL,
                     menu_hash     TEXT NOT NULL DEFAULT '',
-                    discovered_at TEXT
+                    discovered_at TEXT,
+                    enabled       INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS item_links (
@@ -95,6 +96,7 @@ public sealed class BoardDatabase : IDisposable
             EnsureColumn("announcements", "source_menu", "TEXT NOT NULL DEFAULT ''");
             EnsureColumn("announcements", "content_kind", "TEXT NOT NULL DEFAULT ''");
             EnsureColumn("courses", "dedup_at", "TEXT");
+            EnsureColumn("courses", "enabled", "INTEGER NOT NULL DEFAULT 1");
         }
     }
 
@@ -293,7 +295,8 @@ public sealed class BoardDatabase : IDisposable
         lock (_gate)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT id, name, menu_hash, discovered_at, dedup_at FROM courses";
+            cmd.CommandText =
+                "SELECT id, name, menu_hash, discovered_at, dedup_at, enabled FROM courses";
             using var r = cmd.ExecuteReader();
             var list = new List<CourseRecord>();
             while (r.Read())
@@ -304,7 +307,8 @@ public sealed class BoardDatabase : IDisposable
                     Name = r.GetString(1),
                     MenuHash = r.GetString(2),
                     DiscoveredAt = r.IsDBNull(3) ? null : ParseIso(r.GetString(3)),
-                    DedupAt = r.IsDBNull(4) ? null : ParseIso(r.GetString(4))
+                    DedupAt = r.IsDBNull(4) ? null : ParseIso(r.GetString(4)),
+                    Enabled = r.IsDBNull(5) || r.GetInt32(5) != 0
                 });
             }
             return list;
@@ -333,8 +337,107 @@ public sealed class BoardDatabase : IDisposable
         }
     }
 
-    // ---------- duplicate links (same assignment seen in two places) ----------
+    /// <summary>Inserts a course the first time it is seen (enabled by default) and keeps its name fresh.</summary>
+    public void EnsureCourse(string id, string name)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO courses (id, name) VALUES ($id, $name)
+                ON CONFLICT(id) DO UPDATE SET name = excluded.name
+                """;
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$name", name);
+            cmd.ExecuteNonQuery();
+        }
+    }
 
+    public void SetCourseEnabled(string courseId, bool enabled)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "UPDATE courses SET enabled = $v WHERE id = $cid";
+            cmd.Parameters.AddWithValue("$v", enabled ? 1 : 0);
+            cmd.Parameters.AddWithValue("$cid", courseId);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Deletes everything scraped for one course — used when the user unticks it.</summary>
+    public int DeleteCourseData(string courseId)
+    {
+        lock (_gate)
+        {
+            using var tx = _conn.BeginTransaction();
+            var rows = 0;
+
+            foreach (var sql in new[]
+                     {
+                         "DELETE FROM announcements WHERE course_id = $cid",
+                         "DELETE FROM course_paths  WHERE course_id = $cid",
+                         "DELETE FROM item_links    WHERE course_id = $cid"
+                     })
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = sql;
+                cmd.Parameters.AddWithValue("$cid", courseId);
+                rows += cmd.ExecuteNonQuery();
+            }
+
+            using (var prune = _conn.CreateCommand())
+            {
+                prune.CommandText =
+                    "DELETE FROM analyses WHERE ann_id NOT IN (SELECT id FROM announcements)";
+                prune.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+            return rows;
+        }
+    }
+
+    /// <summary>
+    /// Removes course records (and their scraped data) that the current account no longer lists.
+    /// This is what cleans up another account's courses after a switch.
+    /// </summary>
+    public int PruneCoursesExcept(IReadOnlyCollection<string> keepIds)
+    {
+        if (keepIds.Count == 0) return 0;
+
+        var keep = keepIds as ICollection<string> ?? keepIds.ToList();
+        var keepSet = new HashSet<string>(keep, StringComparer.Ordinal);
+
+        lock (_gate)
+        {
+            var victims = new List<string>();
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT id FROM courses";
+                using var r = cmd.ExecuteReader();
+                while (r.Read())
+                {
+                    var id = r.GetString(0);
+                    if (!keepSet.Contains(id)) victims.Add(id);
+                }
+            }
+
+            foreach (var id in victims)
+            {
+                DeleteCourseData(id);
+
+                using var del = _conn.CreateCommand();
+                del.CommandText = "DELETE FROM courses WHERE id = $id";
+                del.Parameters.AddWithValue("$id", id);
+                del.ExecuteNonQuery();
+            }
+
+            return victims.Count;
+        }
+    }
+
+    // ---------- duplicate links (same assignment seen in two places) ----------
     /// <summary>Replaces the duplicate map for one course. Drops are hidden from the UI.</summary>
     public void ReplaceLinks(string courseId, IEnumerable<(string AnnId, string CanonicalId)> links)
     {

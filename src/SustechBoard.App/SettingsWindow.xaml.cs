@@ -18,7 +18,8 @@ public partial class SettingsWindow : Window
 
     public bool Saved { get; private set; }
 
-    public SettingsWindow(AppSettings settings, Secrets secrets)
+    public SettingsWindow(AppSettings settings, Secrets secrets,
+                          IReadOnlyList<CourseRecord>? courses = null)
     {
         InitializeComponent();
         _settings = settings;
@@ -26,6 +27,8 @@ public partial class SettingsWindow : Window
 
         _initialUser = settings.Username;
         _initialPassword = secrets.Password;
+
+        BuildCourseList(courses ?? Array.Empty<CourseRecord>());
 
         UserBox.Text = settings.Username;
         PasswordBox.Password = secrets.Password;
@@ -53,6 +56,48 @@ public partial class SettingsWindow : Window
             DispFocusTop.IsChecked = true;
 
         UpdateSaveState();
+    }
+
+    // ---------- course selection ----------
+
+    private readonly List<(string Id, System.Windows.Controls.CheckBox Box)> _courseBoxes = new();
+
+    /// <summary>Course id → whether the user left it ticked.</summary>
+    public Dictionary<string, bool> CourseSelection =>
+        _courseBoxes.ToDictionary(c => c.Id, c => c.Box.IsChecked == true);
+
+    private void BuildCourseList(IReadOnlyList<CourseRecord> courses)
+    {
+        _courseBoxes.Clear();
+        CourseListPanel.Children.Clear();
+
+        foreach (var c in courses)
+        {
+            var box = new System.Windows.Controls.CheckBox
+            {
+                Content = c.Name,
+                IsChecked = c.Enabled,
+                Style = (Style)FindResource("DarkCheck"),
+                Margin = new Thickness(0, 3, 0, 0),
+                Tag = c.Id
+            };
+            CourseListPanel.Children.Add(box);
+            _courseBoxes.Add((c.Id, box));
+        }
+
+        CourseEmptyHint.Visibility = _courseBoxes.Count == 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+    }
+
+    private void SelectAllCourses_Click(object sender, RoutedEventArgs e)
+    {
+        foreach (var (_, box) in _courseBoxes) box.IsChecked = true;
+    }
+
+    private void SelectNoCourses_Click(object sender, RoutedEventArgs e)
+    {
+        foreach (var (_, box) in _courseBoxes) box.IsChecked = false;
     }
 
     // ---------- credential verification gate ----------

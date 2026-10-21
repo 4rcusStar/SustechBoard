@@ -18,6 +18,7 @@ public partial class App : Application
     private Secrets _secrets = new();
     private DateTimeOffset _lastSyncAt = DateTimeOffset.MinValue;
     private bool _enriching;
+    private bool _coursePrompted;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -91,7 +92,7 @@ public partial class App : Application
                                    DispatcherPriority.Loaded);
 
         if (e.Args.Any(a => a.Equals("--dev-settings", StringComparison.OrdinalIgnoreCase)))
-            Dispatcher.BeginInvoke(new Action(OpenSettings), DispatcherPriority.Background);
+            _ = Dispatcher.BeginInvoke(new Action(OpenSettings), DispatcherPriority.Background);
 
         if (string.IsNullOrWhiteSpace(_settings.Username) || _secrets.Password.Length == 0)
         {
@@ -171,6 +172,15 @@ public partial class App : Application
                 Notify("SustechBoard", $"发现 {result.NewOrChanged.Count} 条更新 · 当前 {pending} 项待办");
         }
 
+        // First usable sync: ask which courses are actually active. Teachers rarely close a
+        // course site, so this is the moment to drop last term's leftovers.
+        if (!_coursePrompted && _sync.NeedsCourseSelection && _sync.GetCourses().Count > 0)
+        {
+            _coursePrompted = true;
+            Log.Info("首次同步完成，请选择生效课程");
+            _ = Dispatcher.BeginInvoke(new Action(OpenSettings), DispatcherPriority.Background);
+        }
+
         _ = EnrichInBackgroundAsync();
     }
 
@@ -232,12 +242,14 @@ public partial class App : Application
         // captured before it opens — afterwards the old value is gone.
         var beforeUser = _settings.Username.Trim();
 
-        var dialog = new SettingsWindow(_settings, _secrets) { Topmost = true };
+        var courses = _sync?.GetCourses() ?? new List<CourseRecord>();
+        var dialog = new SettingsWindow(_settings, _secrets, courses) { Topmost = true };
         var ok = dialog.ShowDialog();
 
         if (ok != true || !dialog.Saved) return;
 
         _sync?.UpdateSettings(_settings, _secrets);
+        _sync?.ApplyCourseSelection(dialog.CourseSelection);
 
         var afterUser = _settings.Username.Trim();
         if (!string.Equals(beforeUser, afterUser, StringComparison.Ordinal))

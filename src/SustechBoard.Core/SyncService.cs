@@ -118,6 +118,43 @@ public sealed class SyncService : IDisposable
     /// <summary>Ask the next sync to rescan every course menu from scratch.</summary>
     public void RequestFullScan() => _forceFullScan = true;
 
+    /// <summary>Every course seen so far, for the settings picker.</summary>
+    public List<CourseRecord> GetCourses()
+        => _db.LoadCourseRecords().OrderBy(r => r.Name, StringComparer.CurrentCulture).ToList();
+
+    /// <summary>True until the user has confirmed which courses are active at least once.</summary>
+    public bool NeedsCourseSelection => _db.GetMeta("course_selection_done") is null;
+
+    /// <summary>
+    /// Applies the user's course ticks. Unticking a course also deletes its scraped data,
+    /// so an abandoned course site stops contributing rows immediately.
+    /// </summary>
+    public void ApplyCourseSelection(IReadOnlyDictionary<string, bool> selection)
+    {
+        var records = _db.LoadCourseRecords().ToDictionary(r => r.Id, StringComparer.Ordinal);
+        var removed = 0;
+        var changed = 0;
+
+        foreach (var (id, enabled) in selection)
+        {
+            if (!records.TryGetValue(id, out var rec) || rec.Enabled == enabled) continue;
+
+            _db.SetCourseEnabled(id, enabled);
+            changed++;
+            if (!enabled) removed += _db.DeleteCourseData(id);
+            Log.Info($"课程 {(enabled ? "启用" : "停用")}: {rec.Name}");
+        }
+
+        _db.SetMeta("course_selection_done", "1");
+
+        if (changed > 0)
+        {
+            ReloadItems(DateTimeOffset.Now);
+            Updated?.Invoke();
+            if (removed > 0) Log.Info($"停用课程后清理 {removed} 条数据");
+        }
+    }
+
     /// <summary>Number of content areas currently being crawled on every sync.</summary>
     public int SelectedPathCount
     {
@@ -436,9 +473,43 @@ public sealed class SyncService : IDisposable
             _db.SetMeta("owner", currentUser);
 
             StatusChanged?.Invoke("正在读取课程…");
-            var courses = await _fetcher.GetCoursesAsync(ct).ConfigureAwait(false);
+            var allCourses = await _fetcher.GetCoursesAsync(ct).ConfigureAwait(false);
+            foreach (var c in allCourses) _db.EnsureCourse(c.Id, c.Name);
+
+            // Drop course records the current account no longer lists (left over from a switch).
+            if (allCourses.Count > 0)
+            {
+                var pruned = _db.PruneCoursesExcept(
+                    allCourses.Select(c => c.Id).ToHashSet(StringComparer.Ordinal));
+                if (pruned > 0)
+                    Log.Info($"清理 {pruned} 门已不在当前课程列表中的课程");
+            }
+
+            // Only the courses the user ticked are crawled. Teachers often leave last term's
+            // course sites open, and the user does not want that noise.
+            var disabled = _db.LoadCourseRecords()
+                              .Where(r => !r.Enabled)
+                              .Select(r => r.Id)
+                              .ToHashSet(StringComparer.Ordinal);
+            var courses = allCourses.Where(c => !disabled.Contains(c.Id)).ToList();
+
             result.Courses = courses;
             CourseCount = courses.Count;
+
+            if (allCourses.Count > courses.Count)
+                Log.Info($"共 {allCourses.Count} 门课，已停用 {allCourses.Count - courses.Count} 门");
+
+            if (courses.Count == 0)
+            {
+                var msg = allCourses.Count == 0
+                    ? "未读取到任何课程"
+                    : "所有课程都已停用，请在设置里勾选生效课程";
+                LastError = msg;
+                result.Error = msg;
+                StatusChanged?.Invoke(msg);
+                Log.Warn(msg);
+                return result;
+            }
 
             // ---------- Tier A: full structure discovery (expensive, rare) ----------
             var records = _db.LoadCourseRecords();

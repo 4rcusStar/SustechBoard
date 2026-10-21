@@ -157,6 +157,27 @@
                                    VerticalAlignment="Center"/>
                     </StackPanel>
 
+                    <TextBlock Text="生效课程" Style="{StaticResource SectionTitle}"/>
+                    <TextBlock Foreground="{StaticResource TextMuted}" FontSize="10"
+                               Margin="0,3,0,5" TextWrapping="Wrap"
+                               Text="只抓取勾选的课程。老师常不结课，历史课程会一直拖着旧数据——在这里取消勾选即可，其数据会被一并清除。"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,5">
+                        <Button Content="全选" Style="{StaticResource MiniButton}"
+                                Click="SelectAllCourses_Click"/>
+                        <Button Content="全不选" Style="{StaticResource MiniButton}"
+                                Margin="6,0,0,0" Click="SelectNoCourses_Click"/>
+                    </StackPanel>
+                    <ScrollViewer MaxHeight="150" VerticalScrollBarVisibility="Auto">
+                        <ScrollViewer.Resources>
+                            <Style TargetType="ScrollBar" BasedOn="{StaticResource DarkScrollBar}"/>
+                        </ScrollViewer.Resources>
+                        <StackPanel x:Name="CourseListPanel"/>
+                    </ScrollViewer>
+                    <TextBlock x:Name="CourseEmptyHint" Visibility="Collapsed"
+                               Foreground="{StaticResource TextMuted}" FontSize="10"
+                               Margin="0,4,0,0" TextWrapping="Wrap"
+                               Text="还没读到课程列表：完成一次同步后，这里会列出你的课程。"/>
+
                     <TextBlock Text="通知" Style="{StaticResource SectionTitle}"/>
                     <CheckBox x:Name="DesktopNotifyCheck" Content="桌面通知（新公告 / 临近截止）"
                               Style="{StaticResource DarkCheck}"/>

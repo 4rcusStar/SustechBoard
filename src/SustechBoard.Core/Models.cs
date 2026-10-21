@@ -185,6 +185,9 @@ public sealed class CourseRecord
 
     /// <summary>When duplicate detection last ran for this course (null = never).</summary>
     public DateTimeOffset? DedupAt { get; set; }
+
+    /// <summary>False when the user unticked this course; it is then never crawled.</summary>
+    public bool Enabled { get; set; } = true;
 }
 
 /// <summary>A calendar entry flattened from an announcement's events, ready for rendering.</summary>
