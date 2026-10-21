@@ -27,7 +27,7 @@ public sealed class AppSettings
 
     public bool LlmEnabled { get; set; } = true;
     public string LlmBaseUrl { get; set; } = "https://api.deepseek.com/v1";
-    public string LlmModel { get; set; } = "deepseek-chat";
+    public string LlmModel { get; set; } = "deepseek-flash";
 
     /// <summary>Also crawl course content areas (e.g. 学习评价 / 我的作业) besides announcements.</summary>
     public bool ContentScanEnabled { get; set; } = true;
