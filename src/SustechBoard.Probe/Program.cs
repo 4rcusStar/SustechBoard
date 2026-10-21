@@ -30,6 +30,31 @@ if (args.Length >= 1 && args[0] == "--dump")
     return 0;
 }
 
+// Dev helper: show which rows the dedup pass folded away.
+if (args.Length >= 1 && args[0] == "--list-dups")
+{
+    using var ddConn = new Microsoft.Data.Sqlite.SqliteConnection(
+        $"Data Source={AppPaths.DatabaseFile}");
+    ddConn.Open();
+    using var ddCmd = ddConn.CreateCommand();
+    ddCmd.CommandText = """
+        SELECT l.ann_id, l.canonical_id, a.title, c.title
+        FROM item_links l
+        LEFT JOIN announcements a ON a.id = l.ann_id
+        LEFT JOIN announcements c ON c.id = l.canonical_id
+        """;
+    using var ddR = ddCmd.ExecuteReader();
+    int n = 0;
+    while (ddR.Read())
+    {
+        n++;
+        Console.WriteLine($"drop {ddR.GetString(0)}  «{Trunc(ddR.IsDBNull(2) ? "?" : ddR.GetString(2), 40)}»");
+        Console.WriteLine($"  →  keep {ddR.GetString(1)}  «{Trunc(ddR.IsDBNull(3) ? "?" : ddR.GetString(3), 40)}»");
+    }
+    Console.WriteLine($"合计 {n} 条被合并");
+    return 0;
+}
+
 // Dev helper: verify that a content page splits leaf items from sub-folders.
 if (args.Length >= 1 && args[0] == "--selftest-folders")
 {

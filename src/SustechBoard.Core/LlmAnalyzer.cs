@@ -198,6 +198,82 @@ public sealed class LlmAnalyzer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Finds items that describe the same piece of work (an announcement and the matching
+    /// content-area entry are the usual pair). Only ids from the supplied list are accepted.
+    /// Returns null when the call failed, so callers keep their previous mapping.
+    /// </summary>
+    public async Task<List<(string Keep, string Drop)>?> FindDuplicatesAsync(
+        string courseName, IReadOnlyList<string> lines, CancellationToken ct = default)
+    {
+        if (!IsConfigured || lines.Count < 2) return null;
+
+        const string system = """
+            你在帮学生整理 Blackboard 课程条目。同一份作业常会重复出现两次：
+            一次作为**公告**（"Homework 2 已发布，请于…提交"），
+            一次作为**作业区条目**（"Homework 2"）。请找出这类重复。
+
+            只输出 JSON：{"dups":[{"keep":"保留的id","drop":["被隐藏的id"]}]}
+
+            规则：
+            - 只能使用给定列表里出现的 id，绝对不要编造。
+            - 只有指向**同一件事**才合并。
+            - 编号/周次不同的绝不合并（Homework 1 与 Homework 2 是两件事，
+              第三周作业与第四周作业也是两件事）。
+            - 合并时保留信息更全的那条（有截止时间、有附件、说明更详细）。
+            - 拿不准就不要合并：误合并会丢信息，比多显示一条更糟。
+            - 没有重复时返回 {"dups":[]}。
+            """;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"课程：{courseName}");
+        sb.AppendLine("条目（id | 标题 | 截止 | 来源 | 摘要）：");
+        foreach (var line in lines) sb.AppendLine(line);
+
+        var content = await RawChatAsync(system, sb.ToString(), ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(content)) return null;
+
+        var valid = lines
+            .Select(l => l.Split('|')[0].Trim())
+            .Where(s => s.Length > 0)
+            .ToHashSet(StringComparer.Ordinal);
+
+        try
+        {
+            using var doc = JsonDocument.Parse(StripCodeFence(content));
+            if (!doc.RootElement.TryGetProperty("dups", out var arr) ||
+                arr.ValueKind != JsonValueKind.Array) return null;
+
+            var pairs = new List<(string Keep, string Drop)>();
+            foreach (var el in arr.EnumerateArray())
+            {
+                var keep = el.TryGetProperty("keep", out var k) ? k.GetString()?.Trim() : null;
+                if (keep is null || !valid.Contains(keep)) continue;
+
+                if (!el.TryGetProperty("drop", out var drops) ||
+                    drops.ValueKind != JsonValueKind.Array) continue;
+
+                foreach (var d in drops.EnumerateArray())
+                {
+                    var drop = d.GetString()?.Trim();
+                    if (drop is null || !valid.Contains(drop) || drop == keep) continue;
+                    pairs.Add((keep, drop));
+                }
+            }
+
+            // Guard against cycles: a row cannot be both dropped and kept elsewhere.
+            var dropped = pairs.Select(p => p.Drop).ToHashSet(StringComparer.Ordinal);
+            pairs = pairs.Where(p => !dropped.Contains(p.Keep)).ToList();
+
+            return pairs;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("去重返回无法解析: " + ex.Message);
+            return null;
+        }
+    }
+
     /// <summary>Bare chat call used by non-analysis helpers (no retry, no mapping).</summary>
     private async Task<string?> RawChatAsync(string system, string user, CancellationToken ct)
     {

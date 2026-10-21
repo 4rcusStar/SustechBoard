@@ -144,10 +144,11 @@ public static class Prioritizer
 
         var pastEvent = analysis.Deadline is { } eventDate && eventDate < now.AddDays(-1) &&
                         EventWords.Any(w => a.Title.Contains(w, StringComparison.Ordinal));
-        var expiredByDeadline = days is < -7;
 
-        // Expiry wins over manual archiving: an expired item is not restorable,
-        // even if the user archived it by hand earlier.
+        // Anything whose deadline has already passed is not a todo item — it is history.
+        // (Day 0 still counts as today, so same-day deadlines stay in the list.)
+        var expiredByDeadline = days is < 0;
+
         if (stale || expiredByDeadline || pastEvent || analysis.IsNoise)
         {
             item.Priority = Priority.Archive;
@@ -164,8 +165,7 @@ public static class Prioritizer
 
         if (days is { } d)
         {
-            item.Priority = d < 0 ? Priority.P2                          // recently overdue
-                : d <= settings.P0WindowDays ? Priority.P0
+            item.Priority = d <= settings.P0WindowDays ? Priority.P0
                 : d <= settings.P1WindowDays ? Priority.P1
                 : Priority.P2;
             return item;

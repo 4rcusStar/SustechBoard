@@ -182,6 +182,9 @@ public sealed class CourseRecord
     public required string Name { get; init; }
     public string MenuHash { get; set; } = "";
     public DateTimeOffset? DiscoveredAt { get; set; }
+
+    /// <summary>When duplicate detection last ran for this course (null = never).</summary>
+    public DateTimeOffset? DedupAt { get; set; }
 }
 
 /// <summary>A calendar entry flattened from an announcement's events, ready for rendering.</summary>

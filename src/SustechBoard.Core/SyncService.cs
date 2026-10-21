@@ -46,9 +46,63 @@ public sealed class SyncService : IDisposable
     private void ReloadItems(DateTimeOffset now)
     {
         var stored = _db.LoadAll();
+
+        // Rows the dedup pass folded into another row stay in the DB but never reach the UI.
+        var dups = _db.LoadDuplicateIds();
+        if (dups.Count > 0)
+            stored = stored.Where(a => !dups.Contains(a.Id)).ToList();
+
         var analyses = _db.LoadAnalyses();
         Items = Prioritizer.BuildAll(stored, analyses, _settings, now);
     }
+
+    /// <summary>
+    /// Folds duplicate rows (same work announced twice) using the model, re-running only for
+    /// courses whose items changed or that never ran it. A failed call keeps the old mapping.
+    /// </summary>
+    private async Task RecomputeDuplicatesAsync(
+        List<Announcement> all, List<Announcement> changed, CancellationToken ct)
+    {
+        if (!_llm.IsConfigured) return;
+
+        var changedCourses = changed.Select(c => c.CourseId).ToHashSet(StringComparer.Ordinal);
+        var records = _db.LoadCourseRecords().ToDictionary(r => r.Id, StringComparer.Ordinal);
+
+        foreach (var group in all.GroupBy(a => a.CourseId))
+        {
+            if (ct.IsCancellationRequested) break;
+
+            records.TryGetValue(group.Key, out var rec);
+            if (!changedCourses.Contains(group.Key) && rec?.DedupAt is not null) continue;
+
+            var items = group.OrderBy(a => a.Title).Take(40).ToList();
+            if (items.Count < 2)
+            {
+                _db.ReplaceLinks(group.Key, Array.Empty<(string, string)>());
+                continue;
+            }
+
+            var lines = items.Select(a =>
+                $"{a.Id} | {Trunc(a.Title, 46)} | {DeadlineHint(a)} | " +
+                $"{(a.Origin == "content" ? a.SourceMenu : "公告")} | {Trunc(a.Body, 70)}")
+                .ToList();
+
+            var pairs = await _llm.FindDuplicatesAsync(items[0].CourseName, lines, ct).ConfigureAwait(false);
+            if (pairs is null) continue;
+
+            _db.ReplaceLinks(group.Key, pairs.Select(p => (p.Drop, p.Keep)));
+            if (pairs.Count > 0)
+                Log.Info($"{items[0].CourseName}: 合并 {pairs.Count} 条重复条目");
+        }
+    }
+
+    private static string DeadlineHint(Announcement a)
+    {
+        var hit = DateParsing.FindDeadline(a.Body, a.PublishedAt ?? DateTimeOffset.Now);
+        return hit is { } h ? h.Value.ToString("MM-dd HH:mm") : "-";
+    }
+
+    private static string Trunc(string s, int n) => s.Length <= n ? s : s[..n] + "…";
 
     private void RebuildItems()
     {
@@ -498,6 +552,14 @@ public sealed class SyncService : IDisposable
 
             if (!fetchComplete)
                 Log.Warn("本次部分抓取失败，相关课程保留旧数据不做清理");
+
+            // Fold duplicates first so the analysis pass is not paid twice for the same work.
+            if (_settings.ContentScanEnabled)
+            {
+                StatusChanged?.Invoke("正在合并重复条目…");
+                try { await RecomputeDuplicatesAsync(all, changed, ct).ConfigureAwait(false); }
+                catch (Exception ex) { Log.Error("去重失败", ex); }
+            }
 
             // Ensure every announcement has at least a rule-layer analysis.
             StatusChanged?.Invoke("正在分析…");

@@ -73,6 +73,14 @@ public sealed class BoardDatabase : IDisposable
                     menu_hash     TEXT NOT NULL DEFAULT '',
                     discovered_at TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS item_links (
+                    course_id    TEXT NOT NULL,
+                    ann_id       TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    computed_at  TEXT NOT NULL,
+                    PRIMARY KEY (course_id, ann_id)
+                );
                 """;
             cmd.ExecuteNonQuery();
 
@@ -81,6 +89,7 @@ public sealed class BoardDatabase : IDisposable
             EnsureColumn("announcements", "origin", "TEXT NOT NULL DEFAULT 'announcement'");
             EnsureColumn("announcements", "source_menu", "TEXT NOT NULL DEFAULT ''");
             EnsureColumn("announcements", "content_kind", "TEXT NOT NULL DEFAULT ''");
+            EnsureColumn("courses", "dedup_at", "TEXT");
         }
     }
 
@@ -162,7 +171,8 @@ public sealed class BoardDatabase : IDisposable
         {
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = "DELETE FROM analyses; DELETE FROM announcements; " +
-                              "DELETE FROM course_paths; DELETE FROM courses;";
+                              "DELETE FROM course_paths; DELETE FROM courses; " +
+                              "DELETE FROM item_links;";
             cmd.ExecuteNonQuery();
         }
         Log.Info("已清空本地公告、分析缓存与课程路径");
@@ -278,7 +288,7 @@ public sealed class BoardDatabase : IDisposable
         lock (_gate)
         {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT id, name, menu_hash, discovered_at FROM courses";
+            cmd.CommandText = "SELECT id, name, menu_hash, discovered_at, dedup_at FROM courses";
             using var r = cmd.ExecuteReader();
             var list = new List<CourseRecord>();
             while (r.Read())
@@ -288,7 +298,8 @@ public sealed class BoardDatabase : IDisposable
                     Id = r.GetString(0),
                     Name = r.GetString(1),
                     MenuHash = r.GetString(2),
-                    DiscoveredAt = r.IsDBNull(3) ? null : ParseIso(r.GetString(3))
+                    DiscoveredAt = r.IsDBNull(3) ? null : ParseIso(r.GetString(3)),
+                    DedupAt = r.IsDBNull(4) ? null : ParseIso(r.GetString(4))
                 });
             }
             return list;
@@ -313,6 +324,78 @@ public sealed class BoardDatabase : IDisposable
             cmd.Parameters.AddWithValue("$hash", rec.MenuHash ?? "");
             cmd.Parameters.AddWithValue("$da", rec.DiscoveredAt is { } d
                 ? d.ToString(IsoFormat, CultureInfo.InvariantCulture) : DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    // ---------- duplicate links (same assignment seen in two places) ----------
+
+    /// <summary>Replaces the duplicate map for one course. Drops are hidden from the UI.</summary>
+    public void ReplaceLinks(string courseId, IEnumerable<(string AnnId, string CanonicalId)> links)
+    {
+        lock (_gate)
+        {
+            using var tx = _conn.BeginTransaction();
+
+            using (var del = _conn.CreateCommand())
+            {
+                del.CommandText = "DELETE FROM item_links WHERE course_id = $cid";
+                del.Parameters.AddWithValue("$cid", courseId);
+                del.ExecuteNonQuery();
+            }
+
+            var stamp = DateTimeOffset.Now.ToString(IsoFormat, CultureInfo.InvariantCulture);
+            foreach (var (annId, canonicalId) in links)
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = """
+                    INSERT INTO item_links (course_id, ann_id, canonical_id, computed_at)
+                    VALUES ($cid, $aid, $kid, $at)
+                    ON CONFLICT(course_id, ann_id) DO UPDATE SET
+                        canonical_id = excluded.canonical_id,
+                        computed_at  = excluded.computed_at
+                    """;
+                cmd.Parameters.AddWithValue("$cid", courseId);
+                cmd.Parameters.AddWithValue("$aid", annId);
+                cmd.Parameters.AddWithValue("$kid", canonicalId);
+                cmd.Parameters.AddWithValue("$at", stamp);
+                cmd.ExecuteNonQuery();
+            }
+
+            // Record that dedup ran for this course even when nothing was merged.
+            using (var mark = _conn.CreateCommand())
+            {
+                mark.CommandText = "UPDATE courses SET dedup_at = $at WHERE id = $cid";
+                mark.Parameters.AddWithValue("$at", stamp);
+                mark.Parameters.AddWithValue("$cid", courseId);
+                mark.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+        }
+    }
+
+    /// <summary>Announcement ids that are duplicates of a canonical row.</summary>
+    public HashSet<string> LoadDuplicateIds()
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "SELECT ann_id FROM item_links";
+            using var r = cmd.ExecuteReader();
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            while (r.Read()) set.Add(r.GetString(0));
+            return set;
+        }
+    }
+
+    /// <summary>Forgets the duplicate map (used when the account or course set changes).</summary>
+    public void ClearLinks()
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM item_links;";
             cmd.ExecuteNonQuery();
         }
     }
