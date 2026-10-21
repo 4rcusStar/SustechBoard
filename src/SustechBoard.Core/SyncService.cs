@@ -113,10 +113,31 @@ public sealed class SyncService : IDisposable
 
     public void UpdateSettings(AppSettings settings, Secrets secrets)
     {
+        var userChanged = !string.Equals(_settings.Username, settings.Username, StringComparison.Ordinal);
+
         _settings = settings;
         _secrets = secrets;
         _client.UpdateCredentials(settings, secrets);
         _llm.Update(settings, secrets);
+
+        if (userChanged)
+        {
+            Log.Info($"账号已更换为 {settings.Username}，清空上一账号的数据");
+            ResetForAccountChange();
+        }
+    }
+
+    /// <summary>Wipes every scraped row so a different account starts from a clean slate.</summary>
+    public void ResetForAccountChange()
+    {
+        _db.ClearAll();
+        _llmFailed.Clear();
+        Items = Array.Empty<PanelItem>();
+        AnnouncementCount = 0;
+        CourseCount = 0;
+        LastSyncAt = null;
+        LastError = "";
+        Updated?.Invoke();
     }
 
     /// <summary>Populates the panel from SQLite without touching the network.</summary>
@@ -163,12 +184,21 @@ public sealed class SyncService : IDisposable
 
             StatusChanged?.Invoke($"正在抓取 {courses.Count} 门课的公告…");
             var all = new List<Announcement>();
+            var fetchComplete = courses.Count > 0;
+
             foreach (var c in courses)
             {
                 if (ct.IsCancellationRequested) break;
                 var items = await _fetcher.GetAnnouncementsAsync(c, ct).ConfigureAwait(false);
+                if (items is null)
+                {
+                    fetchComplete = false;   // partial fetch — never reconcile on this
+                    continue;
+                }
                 all.AddRange(items);
             }
+
+            if (ct.IsCancellationRequested) fetchComplete = false;
 
             // De-duplicate defensively: Blackboard ids should be unique, but be safe.
             all = all.GroupBy(a => a.Id).Select(g => g.First()).ToList();
@@ -178,6 +208,21 @@ public sealed class SyncService : IDisposable
             result.TotalAnnouncements = all.Count;
             result.NewOrChanged = changed;
             AnnouncementCount = all.Count;
+
+            // Reconcile removals so a switched account (or a dropped course) leaves nothing behind.
+            if (fetchComplete)
+            {
+                var removed = _db.DeleteNotIn(all.Select(a => a.Id).ToList());
+                if (removed > 0)
+                    Log.Info($"清理 {removed} 条本次未返回的旧公告（换号或退课）");
+
+                result.RemovedCount = removed;
+                _db.PruneOrphanAnalyses();
+            }
+            else
+            {
+                Log.Warn("本次抓取不完整，跳过旧公告清理");
+            }
 
             // Ensure every announcement has at least a rule-layer analysis.
             StatusChanged?.Invoke("正在分析…");

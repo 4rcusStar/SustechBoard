@@ -10,6 +10,12 @@ public partial class SettingsWindow : Window
     private readonly AppSettings _settings;
     private readonly Secrets _secrets;
 
+    private readonly string _initialUser;
+    private readonly string _initialPassword;
+
+    /// <summary>Signature of the credential pair that last passed a live login test.</summary>
+    private string? _verifiedSignature;
+
     public bool Saved { get; private set; }
 
     public SettingsWindow(AppSettings settings, Secrets secrets)
@@ -17,6 +23,9 @@ public partial class SettingsWindow : Window
         InitializeComponent();
         _settings = settings;
         _secrets = secrets;
+
+        _initialUser = settings.Username;
+        _initialPassword = secrets.Password;
 
         UserBox.Text = settings.Username;
         PasswordBox.Password = secrets.Password;
@@ -42,10 +51,58 @@ public partial class SettingsWindow : Window
             DispAlwaysBottom.IsChecked = true;
         else
             DispFocusTop.IsChecked = true;
+
+        UpdateSaveState();
+    }
+
+    // ---------- credential verification gate ----------
+
+    private string CredentialSignature() => UserBox.Text.Trim() + "\u0000" + PasswordBox.Password;
+
+    private string SavedSignature() => _initialUser + "\u0000" + _initialPassword;
+
+    /// <summary>
+    /// Saving is allowed only when the credentials are unchanged from what is already stored,
+    /// or when the user has proven them with a live login in this dialog.
+    /// </summary>
+    private bool CredentialsReady()
+    {
+        var current = CredentialSignature();
+        return current == SavedSignature() || current == _verifiedSignature;
+    }
+
+    private void Cred_Changed(object sender, RoutedEventArgs e)
+    {
+        if (SaveButton is null) return;   // fires during InitializeComponent
+        UpdateSaveState();
+    }
+
+    private void UpdateSaveState()
+    {
+        var hasInput = UserBox.Text.Trim().Length > 0 && PasswordBox.Password.Length > 0;
+        var ready = hasInput && CredentialsReady();
+
+        SaveButton.IsEnabled = ready;
+
+        SaveHint.Text = !hasInput
+            ? "请填写学号与密码"
+            : !ready
+                ? "账号已改动，请先点「测试登录」验证"
+                : "";
     }
 
     private void Save_Click(object sender, RoutedEventArgs e)
     {
+        if (!CredentialsReady() ||
+            UserBox.Text.Trim().Length == 0 ||
+            PasswordBox.Password.Length == 0)
+        {
+            UpdateSaveState();
+            TestStatus.Foreground = (Brush)FindResource("P0Brush");
+            TestStatus.Text = "请先填写账号密码并点「测试登录」验证";
+            return;
+        }
+
         _settings.Username = UserBox.Text.Trim();
         _secrets.Password = PasswordBox.Password;   // verbatim: never trimmed
         _settings.RefreshIntervalMinutes = int.TryParse(IntervalBox.Text, out var mins)
@@ -171,7 +228,13 @@ public partial class SettingsWindow : Window
             TestStatus.Foreground = r.Success
                 ? (Brush)FindResource("Accent")
                 : (Brush)FindResource("P0Brush");
-            TestStatus.Text = r.Success ? "✓ 登录成功" : "✗ " + r.Message;
+            TestStatus.Text = r.Success ? "✓ 登录成功，可以保存了" : "✗ " + r.Message;
+
+            if (r.Success)
+            {
+                _verifiedSignature = CredentialSignature();
+                UpdateSaveState();
+            }
         }
         catch (Exception ex)
         {

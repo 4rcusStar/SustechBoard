@@ -17,3 +17,6 @@ publish-selfcontained/
 secrets.dat
 settings.json
 app.log*
+
+dist/
+

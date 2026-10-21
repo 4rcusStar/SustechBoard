@@ -118,10 +118,12 @@
 
                     <TextBlock Text="账号与登录" Style="{StaticResource SectionTitle}"/>
                     <TextBlock Text="学号（SID）" Style="{StaticResource FieldLabel}"/>
-                    <TextBox x:Name="UserBox" Style="{StaticResource FieldBox}"/>
+                    <TextBox x:Name="UserBox" Style="{StaticResource FieldBox}"
+                             TextChanged="Cred_Changed"/>
 
                     <TextBlock Text="密码（原样保存，区分大小写与末尾符号）" Style="{StaticResource FieldLabel}"/>
-                    <PasswordBox x:Name="PasswordBox" Style="{StaticResource FieldPassword}"/>
+                    <PasswordBox x:Name="PasswordBox" Style="{StaticResource FieldPassword}"
+                                 PasswordChanged="Cred_Changed"/>
                     <TextBlock Foreground="{StaticResource TextMuted}" FontSize="10"
                                Margin="0,5,0,0" TextWrapping="Wrap"
                                Text="密码用 Windows DPAPI 加密后存于本机，不会明文落盘、不会上传。"/>
@@ -215,10 +217,13 @@
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
+                <TextBlock x:Name="SaveHint" Grid.Column="0" VerticalAlignment="Center"
+                           FontSize="10" Margin="0,0,8,0" TextWrapping="Wrap"
+                           Foreground="{StaticResource P1Brush}"/>
                 <Button Grid.Column="1" Content="取消" Style="{StaticResource GhostButton}"
                         Margin="0,0,8,0" Click="Cancel_Click"/>
-                <Button Grid.Column="2" Content="保存" Style="{StaticResource PrimaryButton}"
-                        Click="Save_Click"/>
+                <Button x:Name="SaveButton" Grid.Column="2" Content="保存"
+                        Style="{StaticResource PrimaryButton}" Click="Save_Click"/>
             </Grid>
         </Grid>
     </Border>

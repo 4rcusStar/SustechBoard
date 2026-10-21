@@ -129,6 +129,10 @@ public sealed class SyncResult
     public List<Announcement> NewOrChanged { get; set; } = new();
     public List<CourseInfo> Courses { get; set; } = new();
     public DateTimeOffset CompletedAt { get; set; }
+
+    /// <summary>Rows deleted because this fetch no longer returned them.</summary>
+    public int RemovedCount { get; set; }
+
     public string? Error { get; set; }
     public bool Success => Error is null;
 }

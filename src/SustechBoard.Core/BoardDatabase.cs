@@ -94,6 +94,51 @@ public sealed class BoardDatabase : IDisposable
         }
     }
 
+    /// <summary>
+    /// Deletes announcements that this fetch did not return. Without this, switching accounts
+    /// (or dropping a course) leaves the previous account's rows in the panel forever.
+    /// Callers must only invoke this after a *complete* fetch.
+    /// </summary>
+    public int DeleteNotIn(IReadOnlyCollection<string> keepIds)
+    {
+        // Refuse to wipe everything on an obviously empty/failed fetch.
+        if (keepIds.Count == 0) return 0;
+
+        lock (_gate)
+        {
+            var placeholders = string.Join(",", keepIds.Select((_, i) => "$p" + i));
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = $"DELETE FROM announcements WHERE id NOT IN ({placeholders})";
+            var i = 0;
+            foreach (var id in keepIds) cmd.Parameters.AddWithValue("$p" + i++, id);
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Removes analyses whose announcement no longer exists.</summary>
+    public int PruneOrphanAnalyses()
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText =
+                "DELETE FROM analyses WHERE ann_id NOT IN (SELECT id FROM announcements)";
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Drops every scraped row — used when the signed-in account changes.</summary>
+    public void ClearAll()
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM analyses; DELETE FROM announcements;";
+            cmd.ExecuteNonQuery();
+        }
+        Log.Info("已清空本地公告与分析缓存");
+    }
+
     /// <summary>Inserts new rows and updates changed ones. Returns only new/changed items (with IsNew=true).</summary>
     public List<Announcement> Upsert(IEnumerable<Announcement> incoming, DateTimeOffset now)
     {

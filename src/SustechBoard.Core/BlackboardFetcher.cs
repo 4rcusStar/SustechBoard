@@ -53,8 +53,13 @@ public sealed class BlackboardFetcher
         return result;
     }
 
-    /// <summary>Reads every announcement of one course site.</summary>
-    public async Task<List<Announcement>> GetAnnouncementsAsync(CourseInfo course, CancellationToken ct = default)
+    /// <summary>
+    /// Reads every announcement of one course site.
+    /// Returns <c>null</c> when the request failed — distinct from an empty list
+    /// ("this course genuinely has no announcements"), which callers need to tell apart
+    /// before deleting stale rows.
+    /// </summary>
+    public async Task<List<Announcement>?> GetAnnouncementsAsync(CourseInfo course, CancellationToken ct = default)
     {
         var url = BlackboardClient.BbBase + "/webapps/blackboard/execute/announcement" +
                   "?method=search&context=course_entry" +
@@ -62,7 +67,11 @@ public sealed class BlackboardFetcher
                   "&handle=announcements_entry&mode=view";
 
         var html = await _client.GetStringAsync(url, ct).ConfigureAwait(false);
-        if (html is null) return new List<Announcement>();
+        if (html is null)
+        {
+            Log.Warn($"  {course.Name}: 公告抓取失败");
+            return null;
+        }
 
         var doc = await _parser.ParseDocumentAsync(html, ct).ConfigureAwait(false);
         var items = new List<Announcement>();

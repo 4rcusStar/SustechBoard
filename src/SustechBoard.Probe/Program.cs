@@ -32,6 +32,28 @@ if (args.Length >= 1 && args[0] == "--dump")
 
 static string Trunc(string s, int n) => s.Length <= n ? s : s[..n] + "…";
 
+// Dev helper: inject a fake announcement to prove stale-row reconciliation works.
+if (args.Length >= 1 && args[0] == "--inject-fake")
+{
+    using var fkConn = new Microsoft.Data.Sqlite.SqliteConnection(
+        $"Data Source={AppPaths.DatabaseFile}");
+    fkConn.Open();
+    using var fkCmd = fkConn.CreateCommand();
+    fkCmd.CommandText = """
+        INSERT INTO announcements
+            (id, course_id, course_name, title, body, published_at, author,
+             content_hash, first_seen, last_changed, manual_archived)
+        VALUES ('_999999_1','_fake_1','[旧账号遗留]','STALE ROW FROM PREVIOUS ACCOUNT','',
+                NULL,'','fakehash',$now,$now,0)
+        ON CONFLICT(id) DO NOTHING
+        """;
+    var stamp = DateTimeOffset.Now.ToString("yyyy-MM-dd'T'HH:mm:ss.fffzzz");
+    fkCmd.Parameters.AddWithValue("$now", stamp);
+    var n = fkCmd.ExecuteNonQuery();
+    Console.WriteLine(n > 0 ? "已注入 1 条假公告 (_999999_1)" : "假公告已存在");
+    return 0;
+}
+
 // Dev helper: list rows currently flagged as manually archived.
 if (args.Length >= 1 && args[0] == "--list-manual")
 {
@@ -273,8 +295,13 @@ Console.WriteLine(new string('-', 70));
 var all = new List<Announcement>();
 foreach (var c in courses)
 {
-    var items = await fetcher.GetAnnouncementsAsync(c);
-    all.AddRange(items);
+    var fetched = await fetcher.GetAnnouncementsAsync(c);
+    if (fetched is null)
+    {
+        Console.WriteLine($"  !! {c.Name}: 抓取失败");
+        continue;
+    }
+    all.AddRange(fetched);
 }
 Console.WriteLine($"公告合计: {all.Count}");
 
