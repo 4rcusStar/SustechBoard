@@ -69,7 +69,7 @@ dotnet publish src\SustechBoard.App -c Release -r win-x64 --self-contained false
   -o publish
 ```
 
-免安装运行时的自包含发布（约 150 MB）：
+免安装运行时的自包含发布（约 66 MB，压缩后）：
 
 ```powershell
 dotnet publish src\SustechBoard.App -c Release -r win-x64 --self-contained true `
@@ -377,4 +377,23 @@ App 的开发期开关（不影响正常使用）：
 - **相对时间无法换算**：如"大二暑假""两周后"不会转成具体日期，规则层会留空
 - **LLM 属于增强**：关闭或失败时回落到规则层，界面标注"规则分析"
 - **webhook 仅适配群机器人**：企业微信 markdown 格式；其他端点发通用 JSON
+- **登录固定直连**：客户端强制 `UseProxy = false`，只访问 `cas.sustech.edu.cn` 与 `bb.sustech.edu.cn`。
+  系统里残留的代理/加速器不参与，也不会再因为 GET 与 POST 出口不同而让 CAS 认不出自己发的 token
+
+## 登录失败怎么读报错
+
+CAS 的失败形态有三种，程序现在分开报：
+
+| 界面提示 | 实际含义 | 处理 |
+|---|---|---|
+| `CAS 拒绝: 认证信息无效。` | CAS 明确拒绝：账号或密码错 | 检查密码，末尾符号别漏；**不会自动重试**，避免触发锁定 |
+| `CAS 未受理登录（已自动重试）· 检查本机代理或抓包软件` | 登录页回来了但**没签发票据**，CAS 连表单都没受理 | 关掉抓包/加速器；看 `%LOCALAPPDATA%\SustechBoard\cas-failure.html` 和 `app.log` |
+| `CAS 放行，但 Blackboard 拒绝该账号的 SSO 票据` | CAS 认证通过（票据已签发），Blackboard 侧不认这个账号 | 确认 Blackboard 里有没有该账号/是否允许访问 |
+
+诊断细节：
+
+- 失败时 CAS 返回的原始页面会覆盖写到 `%LOCALAPPDATA%\SustechBoard\cas-failure.html`
+- 非凭据类失败会**自动换新 Cookie 重取 `execution` 再登一次**，并用关闭自动跳转的探针判断票据是否真的签发
+- CAS 6.2 的错误横幅是 `<div class="banner banner-danger"><p>…</p></div>`；旧版 `id="msg"` 正则对现网模板无效，已改为 banner 解析并保留旧式回退
+
 

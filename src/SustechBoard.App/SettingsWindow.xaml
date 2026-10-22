@@ -132,7 +132,8 @@
                         <Button x:Name="TestButton" Content="测试登录" Style="{StaticResource GhostButton}"
                                 Click="Test_Click"/>
                         <TextBlock x:Name="TestStatus" VerticalAlignment="Center" Margin="10,0,0,0"
-                                   FontSize="11" Foreground="{StaticResource TextMuted}"/>
+                                   FontSize="11" Foreground="{StaticResource TextMuted}"
+                                   TextWrapping="Wrap" MaxWidth="380"/>
                     </StackPanel>
 
                     <TextBlock Text="刷新策略" Style="{StaticResource SectionTitle}"/>

@@ -22,6 +22,9 @@ public static class AppPaths
     public static string DatabaseFile => Path.Combine(RootDir, "board.db");
     public static string LogFile => Path.Combine(RootDir, "app.log");
 
+    /// <summary>Raw CAS response page from the last failed login, kept for diagnosis.</summary>
+    public static string CasFailureFile => Path.Combine(RootDir, "cas-failure.html");
+
     public static void EnsureCreated() => Directory.CreateDirectory(RootDir);
 }
 

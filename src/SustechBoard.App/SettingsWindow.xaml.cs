@@ -265,6 +265,10 @@ public partial class SettingsWindow : Window
                 ? (Brush)FindResource("Accent")
                 : (Brush)FindResource("P0Brush");
             TestStatus.Text = r.Success ? "✓ 登录成功，可以保存了" : "✗ " + r.Message;
+            TestStatus.ToolTip = r.Success
+                ? null
+                : "详细原因见 %LOCALAPPDATA%\\SustechBoard\\app.log" +
+                  "（CAS 返回的原始页面存为 cas-failure.html）";
 
             if (r.Success)
             {
