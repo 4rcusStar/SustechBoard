@@ -32,6 +32,15 @@ public sealed class BlackboardClient : IDisposable
     private static readonly Regex LegacyMessageRegex =
         new("id=\"msg\"[^>]*>\\s*([^<]+)", RegexOptions.Compiled);
 
+    private static readonly Regex FormBlockRegex =
+        new("(?is)<form(?<attrs>[^>]*)>(?<body>.*?)</form>", RegexOptions.Compiled);
+
+    private static readonly Regex InputTagRegex =
+        new("(?is)<(?:input|button)(?<attrs>[^>]*)>", RegexOptions.Compiled);
+
+    private static readonly Regex AttrRegex =
+        new("(?<name>[a-zA-Z_:][-a-zA-Z0-9_:.]*)\\s*=\\s*\"(?<value>[^\"]*)\"", RegexOptions.Compiled);
+
     private CookieContainer _cookies = new();
     private HttpClient _http = null!;
     private AppSettings _settings;
@@ -162,6 +171,15 @@ public sealed class BlackboardClient : IDisposable
 
             SaveFailurePage(raw);
 
+            // Last resort: the page may be a mandatory CAS notice (不是错误横幅) that only needs
+            // _eventId=proceed. Answer it with the main client and carry on.
+            var lateNotice = ParseCasNotice(raw.Html);
+            if (lateNotice is not null)
+            {
+                var proceeded = await SubmitCasNoticeAsync(lateNotice, ct).ConfigureAwait(false);
+                if (proceeded is not null) return proceeded;
+            }
+
             if (raw.Banner.Length > 0)
                 return Fail($"CAS 拒绝: {raw.Banner}");
 
@@ -214,6 +232,17 @@ public sealed class BlackboardClient : IDisposable
         if ((int)resp.StatusCode == 401 || finalUri.Contains("/cas/login", StringComparison.OrdinalIgnoreCase))
         {
             var msg = ExtractCasMessage(respHtml);
+
+            // CAS can wedge a "认证警告" page between the credentials and the ticket, e.g. when the
+            // account has no recovery mail/phone ("为了方便找回密码，请设置密保邮箱或手机").
+            // It is not an error banner: it just carries the next flow state and a 继续 button.
+            var notice = ParseCasNotice(respHtml);
+            if (notice is not null)
+            {
+                var proceeded = await SubmitCasNoticeAsync(notice, ct).ConfigureAwait(false);
+                if (proceeded is not null) return new AttemptOutcome(proceeded, false);
+            }
+
             var rejected = (int)resp.StatusCode == 401 || msg.Length > 0;
             return new AttemptOutcome(
                 Fail($"CAS 拒绝: {(msg.Length > 0 ? msg : $"HTTP {(int)resp.StatusCode}")}"), rejected);
@@ -223,6 +252,82 @@ public sealed class BlackboardClient : IDisposable
             return new AttemptOutcome(Fail($"登录后返回 HTTP {(int)resp.StatusCode}"), false);
 
         return new AttemptOutcome(await CompleteLoginAsync(ct).ConfigureAwait(false), false);
+    }
+
+    /// <summary>A CAS interstitial page that must be acknowledged before a ticket is issued.</summary>
+    public sealed record CasNotice(string Action, string EventId, IReadOnlyList<string> FieldNames,
+                                   IReadOnlyList<KeyValuePair<string, string>> Fields);
+
+    /// <summary>
+    /// Parses a CAS "认证警告" interstitial. Only the form carrying <c>_eventId=proceed</c> (the 继续
+    /// button) is accepted — <c>submit</c> and <c>resetPassword</c> forms are ignored on purpose so a
+    /// plain login page can never be mistaken for a notice.
+    /// </summary>
+    public static CasNotice? ParseCasNotice(string html)
+    {
+        if (string.IsNullOrEmpty(html) || !html.Contains("_eventId", StringComparison.Ordinal)) return null;
+
+        foreach (Match form in FormBlockRegex.Matches(html))
+        {
+            var fields = new List<KeyValuePair<string, string>>();
+            var eventId = "";
+
+            foreach (Match tag in InputTagRegex.Matches(form.Groups["body"].Value))
+            {
+                var name = "";
+                var value = "";
+                foreach (Match attr in AttrRegex.Matches(tag.Groups["attrs"].Value))
+                {
+                    var key = attr.Groups["name"].Value;
+                    if (key.Equals("name", StringComparison.OrdinalIgnoreCase)) name = attr.Groups["value"].Value;
+                    else if (key.Equals("value", StringComparison.OrdinalIgnoreCase)) value = attr.Groups["value"].Value;
+                }
+                if (name.Length == 0) continue;
+                if (name == "_eventId") eventId = value;
+                fields.Add(new KeyValuePair<string, string>(name, value));
+            }
+
+            if (!eventId.Equals("proceed", StringComparison.Ordinal)) continue;
+
+            var action = "/cas/login";
+            foreach (Match attr in AttrRegex.Matches(form.Groups["attrs"].Value))
+            {
+                if (attr.Groups["name"].Value.Equals("action", StringComparison.OrdinalIgnoreCase) &&
+                    attr.Groups["value"].Value.Length > 0)
+                {
+                    action = attr.Groups["value"].Value;
+                }
+            }
+
+            return new CasNotice(action, eventId, fields.Select(f => f.Key).ToList(), fields);
+        }
+
+        return null;
+    }
+
+    /// <summary>Clicks 继续 on a CAS notice; returns null when it did not produce a session.</summary>
+    private async Task<LoginResult?> SubmitCasNoticeAsync(CasNotice notice, CancellationToken ct)
+    {
+        var url = notice.Action.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+            ? notice.Action
+            : new Uri(new Uri(CasBase), notice.Action).ToString();
+
+        var body = string.Join("&", notice.Fields.Select(
+            kv => Uri.EscapeDataString(kv.Key) + "=" + Uri.EscapeDataString(kv.Value)));
+
+        Log.Info($"CAS 返回提示页（_eventId={notice.EventId}，字段 {string.Join("/", notice.FieldNames)}），自动点「继续」");
+
+        using var resp = await PostFormUrlEncodedAsync(_http, url, body, ct).ConfigureAwait(false);
+        var finalUri = resp.RequestMessage?.RequestUri?.ToString() ?? "";
+        var html = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+        if (finalUri.Contains("/cas/login", StringComparison.OrdinalIgnoreCase) || LooksLikeLoginPage(html))
+        {
+            Log.Warn("CAS 提示页未能继续：仍未签发票据");
+            return null;
+        }
+
+        return await CompleteLoginAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>Confirms the session by actually reaching Blackboard, then marks us logged in.</summary>
@@ -287,8 +392,8 @@ public sealed class BlackboardClient : IDisposable
         return new RawLogin("", status, ExtractCasMessage(postHtml), postHtml, "");
     }
 
-    private async Task<HttpResponseMessage> PostCredentialsAsync(HttpClient http, string loginUrl, string execution,
-                                                                 CancellationToken ct)
+    private Task<HttpResponseMessage> PostCredentialsAsync(HttpClient http, string loginUrl, string execution,
+                                                          CancellationToken ct)
     {
         // Password is used verbatim: no Trim, no normalization.
         var body = "username=" + Uri.EscapeDataString(_settings.Username)
@@ -296,7 +401,13 @@ public sealed class BlackboardClient : IDisposable
                  + "&execution=" + Uri.EscapeDataString(execution)
                  + "&_eventId=submit&geolocation=";
 
-        using var req = new HttpRequestMessage(HttpMethod.Post, loginUrl)
+        return PostFormUrlEncodedAsync(http, loginUrl, body, ct);
+    }
+
+    private async Task<HttpResponseMessage> PostFormUrlEncodedAsync(HttpClient http, string url, string body,
+                                                                    CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Post, url)
         {
             Content = new StringContent(body, Encoding.UTF8, "application/x-www-form-urlencoded")
         };

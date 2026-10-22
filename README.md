@@ -396,4 +396,24 @@ CAS 的失败形态有三种，程序现在分开报：
 - 非凭据类失败会**自动换新 Cookie 重取 `execution` 再登一次**，并用关闭自动跳转的探针判断票据是否真的签发
 - CAS 6.2 的错误横幅是 `<div class="banner banner-danger"><p>…</p></div>`；旧版 `id="msg"` 正则对现网模板无效，已改为 banner 解析并保留旧式回退
 
+### 认证警告页（`_eventId=proceed`）
+
+没设置**密保邮箱或手机**的账号，CAS 会在「密码校验通过」和「签发票据」之间插一页：
+
+```html
+<form method="post" id="form" action="/cas/login">
+  <input type="hidden" name="execution" value="…">
+  <input type="hidden" name="_eventId" value="proceed" />
+  <button name="continue" value="继续">继续</button>
+</form>
+```
+
+页面正文是「认证警告 / 为了方便找回密码，请设置密保邮箱或手机」。这一页**既不是 401 也不是错误横幅**，
+以前被当成「CAS 拒绝: HTTP 200」，账户密码明明正确却永远登不进去。
+
+`BlackboardClient.ParseCasNotice` 只认 `_eventId=proceed` 这一种表单（`submit`、`resetPassword` 一律忽略，
+避免把登录页本身误判成提示页），命中后自动提交「继续」并继续走完 SSO。
+该提示会一直出现，直到账号在 CAS 里补上密保邮箱或手机。
+
+
 

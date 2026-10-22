@@ -4,6 +4,27 @@ using SustechBoard.Core;
 
 Console.OutputEncoding = Encoding.UTF8;
 
+// Dev helper: parse a saved CAS page and report the interstitial form we would auto-submit.
+if (args.Length >= 2 && args[0] == "--cas-notice")
+{
+    var noticeHtml = File.ReadAllText(args[1], Encoding.UTF8);
+    var notice = BlackboardClient.ParseCasNotice(noticeHtml);
+    if (notice is null)
+    {
+        Console.WriteLine("未识别到 _eventId=proceed 提示页");
+        return 1;
+    }
+    Console.WriteLine($"action  = {notice.Action}");
+    Console.WriteLine($"eventId = {notice.EventId}");
+    Console.WriteLine($"fields  = {string.Join(", ", notice.FieldNames)}");
+    foreach (var kv in notice.Fields)
+    {
+        var shown = kv.Value.Length > 48 ? kv.Value[..48] + $"…({kv.Value.Length} chars)" : kv.Value;
+        Console.WriteLine($"  {kv.Key} = {shown}");
+    }
+    return 0;
+}
+
 // Dev helper: inspect how the current database ranks without touching the network.
 if (args.Length >= 1 && args[0] == "--dump")
 {
