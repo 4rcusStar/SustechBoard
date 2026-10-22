@@ -87,6 +87,15 @@ public sealed class BoardDatabase : IDisposable
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                -- Archive decisions outlive the announcement row. A course fetch can briefly stop
+                -- returning an item (re-discovery, a flaky content area), the row gets reconciled
+                -- away, and the next fetch inserts it again; without this table the recreated row
+                -- would silently come back as an unread todo.
+                CREATE TABLE IF NOT EXISTS archive_state (
+                    ann_id      TEXT PRIMARY KEY,
+                    archived_at TEXT NOT NULL
+                );
                 """;
             cmd.ExecuteNonQuery();
 
@@ -97,6 +106,14 @@ public sealed class BoardDatabase : IDisposable
             EnsureColumn("announcements", "content_kind", "TEXT NOT NULL DEFAULT ''");
             EnsureColumn("courses", "dedup_at", "TEXT");
             EnsureColumn("courses", "enabled", "INTEGER NOT NULL DEFAULT 1");
+
+            // Seed the archive table from rows archived before it existed. Idempotent.
+            using var backfill = _conn.CreateCommand();
+            backfill.CommandText = """
+                INSERT OR IGNORE INTO archive_state (ann_id, archived_at)
+                SELECT id, last_changed FROM announcements WHERE manual_archived = 1;
+                """;
+            backfill.ExecuteNonQuery();
         }
     }
 
@@ -129,11 +146,77 @@ public sealed class BoardDatabase : IDisposable
     {
         lock (_gate)
         {
+            using var tx = _conn.BeginTransaction();
+
+            using (var cmd = _conn.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = "UPDATE announcements SET manual_archived = $v WHERE id = $id";
+                cmd.Parameters.AddWithValue("$v", archived ? 1 : 0);
+                cmd.Parameters.AddWithValue("$id", annId);
+                if (cmd.ExecuteNonQuery() == 0) return false;
+            }
+
+            using (var state = _conn.CreateCommand())
+            {
+                state.Transaction = tx;
+                state.CommandText = archived
+                    ? """
+                      INSERT INTO archive_state (ann_id, archived_at) VALUES ($id, $at)
+                      ON CONFLICT(ann_id) DO UPDATE SET archived_at = excluded.archived_at
+                      """
+                    : "DELETE FROM archive_state WHERE ann_id = $id";
+                if (archived)
+                    state.Parameters.AddWithValue("$at", DateTimeOffset.Now.ToString(IsoFormat, CultureInfo.InvariantCulture));
+                state.Parameters.AddWithValue("$id", annId);
+                state.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+            return true;
+        }
+    }
+
+    /// <summary>Announcement ids the user archived, kept even when the announcement row is gone.</summary>
+    private HashSet<string> LoadArchivedIds()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "SELECT ann_id FROM archive_state";
+        using var r = cmd.ExecuteReader();
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        while (r.Read()) set.Add(r.GetString(0));
+        return set;
+    }
+
+    private void MarkArchived(string annId)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = "UPDATE announcements SET manual_archived = 1 WHERE id = $id";
+        cmd.Parameters.AddWithValue("$id", annId);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Number of remembered archive decisions (diagnostics).</summary>
+    public int ArchiveStateCount()
+    {
+        lock (_gate)
+        {
             using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "UPDATE announcements SET manual_archived = $v WHERE id = $id";
-            cmd.Parameters.AddWithValue("$v", archived ? 1 : 0);
-            cmd.Parameters.AddWithValue("$id", annId);
-            return cmd.ExecuteNonQuery() > 0;
+            cmd.CommandText = "SELECT COUNT(*) FROM archive_state";
+            return Convert.ToInt32(cmd.ExecuteScalar() ?? 0, CultureInfo.InvariantCulture);
+        }
+    }
+
+    /// <summary>Forgets archive decisions older than <paramref name="days"/> so the table stays small.</summary>
+    public int PruneArchiveState(int days = 180)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM archive_state WHERE archived_at < $cut";
+            cmd.Parameters.AddWithValue("$cut",
+                DateTimeOffset.Now.AddDays(-days).ToString(IsoFormat, CultureInfo.InvariantCulture));
+            return cmd.ExecuteNonQuery();
         }
     }
 
@@ -179,7 +262,7 @@ public sealed class BoardDatabase : IDisposable
             using var cmd = _conn.CreateCommand();
             cmd.CommandText = "DELETE FROM analyses; DELETE FROM announcements; " +
                               "DELETE FROM course_paths; DELETE FROM courses; " +
-                              "DELETE FROM item_links;";
+                              "DELETE FROM item_links; DELETE FROM archive_state;";
             cmd.ExecuteNonQuery();
         }
         Log.Info("已清空本地公告、分析缓存与课程路径");
@@ -542,6 +625,7 @@ public sealed class BoardDatabase : IDisposable
         var changed = new List<Announcement>();
         lock (_gate)
         {
+            var archived = LoadArchivedIds();
             using var tx = _conn.BeginTransaction();
             foreach (var a in incoming)
             {
@@ -551,9 +635,22 @@ public sealed class BoardDatabase : IDisposable
                 {
                     a.FirstSeen = now;
                     a.LastChanged = now;
-                    a.IsNew = true;
                     Insert(a);
-                    changed.Add(a);
+
+                    if (archived.Contains(a.Id))
+                    {
+                        // The row disappeared for a while (re-discovery, one bad fetch) and is now
+                        // back. The user archived it earlier, so restore that instead of surfacing
+                        // it as a brand-new todo again. Not counted as a change: no notification.
+                        MarkArchived(a.Id);
+                        a.IsManuallyArchived = true;
+                        Log.Info("恢复手动归档: " + a.Id);
+                    }
+                    else
+                    {
+                        a.IsNew = true;
+                        changed.Add(a);
+                    }
                 }
                 else if (!string.Equals(existingHash, a.ContentHash, StringComparison.Ordinal))
                 {

@@ -646,6 +646,7 @@ public sealed class SyncService : IDisposable
 
             result.RemovedCount = removed;
             _db.PruneOrphanAnalyses();
+            _db.PruneArchiveState();
 
             if (!fetchComplete)
                 Log.Warn("本次部分抓取失败，相关课程保留旧数据不做清理");

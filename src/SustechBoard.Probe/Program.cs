@@ -4,6 +4,48 @@ using SustechBoard.Core;
 
 Console.OutputEncoding = Encoding.UTF8;
 
+// Dev helper: prove that a manual archive survives the announcement row being recreated.
+if (args.Length >= 1 && args[0] == "--selftest-archive")
+{
+    var tmpDb = Path.Combine(Path.GetTempPath(), "sustechboard-archive-" + Guid.NewGuid().ToString("N") + ".db");
+    var ok = true;
+    try
+    {
+        using var arDb = new BoardDatabase(tmpDb);
+        Announcement Make() => new()
+        {
+            Id = "t1", CourseId = "c1", CourseName = "Course", Title = "Homework 1",
+            Body = "due 2026-11-01", Author = "", ContentHash = "h1",
+            PublishedAt = DateTimeOffset.Now.AddDays(-1)
+        };
+
+        var first = arDb.Upsert(new[] { Make() }, DateTimeOffset.Now);
+        Console.WriteLine($"1) 首次插入   changed={first.Count}");
+
+        Console.WriteLine($"2) 手动归档   {arDb.SetManualArchived("t1", true)}");
+        var afterArchive = arDb.LoadAll().First(a => a.Id == "t1");
+        Console.WriteLine($"   落库标志   {afterArchive.IsManuallyArchived}");
+        ok &= afterArchive.IsManuallyArchived;
+
+        var deleted = arDb.DeleteNotInCourse("c1", new[] { "other-row" });
+        Console.WriteLine($"3) 行被清理   删除 {deleted} 行，剩余 {arDb.LoadAll().Count} 行");
+
+        var second = arDb.Upsert(new[] { Make() }, DateTimeOffset.Now);
+        var restored = arDb.LoadAll().First(a => a.Id == "t1");
+        Console.WriteLine($"4) 重新插入   changed={second.Count}  归档标志={restored.IsManuallyArchived}");
+        ok &= restored.IsManuallyArchived;
+        ok &= second.Count == 0;   // a restored row must not be pushed as a brand-new todo
+    }
+    finally
+    {
+        foreach (var f in new[] { tmpDb, tmpDb + "-wal", tmpDb + "-shm" })
+            try { File.Delete(f); } catch { /* temp file */ }
+    }
+
+    Console.WriteLine(ok ? "PASS: 行重建后归档状态仍保留" : "FAIL: 行重建后归档状态丢失");
+    return ok ? 0 : 1;
+}
+
 // Dev helper: parse a saved CAS page and report the interstitial form we would auto-submit.
 if (args.Length >= 2 && args[0] == "--cas-notice")
 {
@@ -39,7 +81,8 @@ if (args.Length >= 1 && args[0] == "--dump")
     Console.WriteLine("分布: " + string.Join("  ", dumpItems.GroupBy(i => i.Priority)
         .OrderBy(g => g.Key).Select(g => $"{g.Key}={g.Count()}")));
     Console.WriteLine($"归档拆分: 手动归档={dumpItems.Count(i => i.ArchiveKind == ArchiveKind.Manual)}  " +
-                      $"过期归档={dumpItems.Count(i => i.ArchiveKind == ArchiveKind.Expired)}");
+                      $"过期归档={dumpItems.Count(i => i.ArchiveKind == ArchiveKind.Expired)}  " +
+                      $"归档记忆={dumpDb.ArchiveStateCount()}");
     Console.WriteLine(new string('-', 84));
     foreach (var i in dumpItems.Where(x => x.Priority <= Priority.P2)
                            .OrderBy(x => x.Priority).ThenBy(x => x.DaysLeft ?? int.MaxValue))
